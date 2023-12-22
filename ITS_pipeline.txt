@@ -1,0 +1,63 @@
+########################################
+# FINAL PIPELINE
+#########################################
+
+#!/bin/bash
+#SBATCH --job-name=denovoOTUS
+#SBATCH --nodes=1
+#SBATCH --time=5:00:00
+#SBATCH --output=denovoOTUS.out
+#SBATCH --error=denovoOTUS.err
+#SBATCH --partition short
+
+
+
+ml load miniconda
+source activate /project/brookings_minion/ampenv
+
+THREADS=72
+CLUSTER_ID=0.97
+
+# rename reads
+#for f in *R1*.fastq.gz; do mv $f ${f/_S*_L001_R1_001/_F}; done # forward reads
+#for f in *R2*.fastq.gz; do mv $f ${f/_S*_L001_R2_001/_R}; done # reverse reads
+
+for i in *_ITS_F.fastq.gz; 
+	do SAMPLE=${i/_F.fastq.gz/}; 
+	echo ${SAMPLE};
+	cutadapt -g CTTGGTCATTTAGAGGAAGTAA -a TCGTCGGCAGCGTCAGATGTGTATAAGAGACAG -G GCTGCGTTCTTCATCGATGC -A GTCTCGTGGGCTCGGAGATGTGTATAAGAGACAG -j 72 -rc -q 20,30 -o ${SAMPLE}_F_primertrimmed.fastq -p ${SAMPLE}_R_primertrimmed.fastq ${SAMPLE}_F.fastq.gz ${SAMPLE}_R.fastq.gz;
+	vsearch --fastq_mergepairs ${SAMPLE}_F_primertrimmed.fastq --rev ${SAMPLE}_R_primertrimmed.fastq --fastqout ${SAMPLE}_merged.fastq --fastqout_notmerged_fwd ${SAMPLE}_F_nomerge.fastq --fastq_maxdiffs 5 --fastq_allowmergestagger; 
+	cutadapt -j 72 -q 30 -m 100 -o ${SAMPLE}_filter_1.fastq ${SAMPLE}_merged.fastq # quality trim 3' end and add min length
+	vsearch --fastx_filter ${SAMPLE}_filter_1.fastq --fastqout ${SAMPLE}_filtered.fastq --fastq_stripleft 18 --fastq_maxns 0 --fastq_maxee 1; # quality trim 5' end, add max N and max ee
+	vsearch --fastx_uniques ${SAMPLE}_filtered.fastq --fastaout ${SAMPLE}_derep.fasta --sizeout --strand both --relabel ${SAMPLE}_ --sample ${SAMPLE} --fasta_width 0; done
+
+# make OTUs
+# combine all dereplicated fastas
+cat *ITS_derep.fasta > all.fasta # this is the one I will use to make the otu table with --usearch_global
+
+# Dereplicate across samples
+vsearch --fastx_uniques all.fasta --sizein --sizeout --fasta_width 0 --fastaout combined_derep.fasta
+
+# de novo otus
+vsearch --cluster_size combined_derep.fasta --threads 72 --id 0.97 --sizein --sizeout --fasta_width 0 --centroids centroids.fasta
+
+# relabel otus
+vsearch --fastx_filter centroids.fasta --threads 72 --sizein --sizeout --fasta_width 0 --relabel OTU_ --fastaout all_97_otus.fasta
+
+# de novo chimera detection
+vsearch --uchime_denovo all_97_otus.fasta --sizein --sizeout --fasta_width 0 --nonchimeras all_97_otus_nonchim.fasta
+
+# filter out singleton otus
+vsearch --sortbysize all_97_otus_nonchim.fasta --output otus_filtered.fasta --sizeout --minsize 1
+
+# Map sequences to OTUs by searching. use all.fasta as the query and the 97% OTUs as the database. id at 97%
+vsearch --usearch_global all.fasta --threads 72 --db all_97_otus_nonchim.fasta --id 0.97 --sizein --sizeout --fasta_width 0 --otutabout otu_table_its1_97.txt
+
+# assign taxonomy
+vsearch --sintax all_97_otus_nonchim.fasta --db ../unite_9_eukaryotes.fasta --randseed 44 --sintax_cutoff 0.9 --tabbedout taxonomy_otus.txt
+
+# run ITSx for TBAS and filter to fungi only.
+ITSx -i all_97_otus_nonchim.fasta -o all_97_otus_nonchim_ITSx.fasta -t "fungi"
+
+# remove otu size info for TBAS
+cut -d\; -f1 all_97_otus_nonchim_ITSx.fasta.ITS1.fasta > fungi_97_otus_ITS1_nosize.fasta
