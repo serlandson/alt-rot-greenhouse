@@ -42,7 +42,7 @@ set.seed(44)
 
 ```{r, load data}
 
-samples <- read.csv("/Users/sonya.erlandson/OneDrive - USDA/greenhouse crop identity 2022/data tables/all_sample_data.csv", 
+samples <- read.csv("data tables/all_sample_data.csv", 
                     stringsAsFactors = F, 
                     row.names = 1)
 
@@ -110,14 +110,14 @@ qPCR data
 
 ```{r}
 ### These are 99% OTUs with taxonomy assigned from the gg2 phylogeny/taxonomy
-bacteria <- read.table("/Users/sonya.erlandson/OneDrive - USDA/greenhouse crop identity 2022/data tables/16S/greengenes2/otu_table_16S_gg2.tsv", 
+bacteria <- read.table("data tables/16S/greengenes2/otu_table_16S_gg2.tsv", 
                        sep = "\t", 
                        row.names = 1, 
                        header = T)
 
 bacteria <- as.data.frame(t(bacteria))
 
-bacteria.tax <- read.table("/Users/sonya.erlandson/OneDrive - USDA/greenhouse crop identity 2022/data tables/16S/greengenes2/taxonomy.tsv", 
+bacteria.tax <- read.table("data tables/16S/greengenes2/taxonomy.tsv", 
                            sep = "\t", 
                            header = T)
 
@@ -126,7 +126,7 @@ bac.taxa.names <- data.frame(gsub(pattern = "[dpocfgs]__",
                                   replacement = "", bac.taxa.names))
 colnames(bac.taxa.names) <- c("taxonomy") # remove taxonomy formatting
 
-source("/Users/sonya.erlandson/OneDrive - USDA/greenhouse crop identity 2022/scripts/taxaLabels_for_gg2_16S.R")
+source("scripts/taxaLabels_for_gg2_16S.R")
 
 bac.taxa.names <- separate(bac.taxa.names, 
                            col = taxonomy, 
@@ -710,12 +710,12 @@ soybeansamp$soybean.wheat[soybeansamp$soybean.wheat == "Spring Wheat"] <- 1
 ## Load and filter OTUs
 ```{r}
 ### These are 97% OTUs with taxonomy assigned from unite with sintax in vsearch. bootstrap cut off was 0.60.
-fungi <- read.table("/Users/sonya.erlandson/OneDrive - USDA/greenhouse crop identity 2022/data tables/ITS/otu_table_its1_97.txt", 
+fungi <- read.table("data tables/ITS/otu_table_its1_97.txt", 
                     sep = "\t", 
                     header=T, 
                     row.names = 1)
 
-all.tax <- read.table("/Users/sonya.erlandson/OneDrive - USDA/greenhouse crop identity 2022/data tables/ITS/taxonomy_otus.txt", 
+all.tax <- read.table("data tables/ITS/taxonomy_otus.txt", 
                       sep = "\t", 
                       header = F)
 
@@ -746,7 +746,7 @@ fungi.tax <- all.tax[str_detect(pattern = "Fungi",
                                 negate = F) & as.numeric(all.tax$size) >1 , ] # get fungi with size >=2
 
 # add taxa labels
-source("/Users/sonya.erlandson/OneDrive - USDA/greenhouse crop identity 2022/scripts/taxaLabels_species_level.R")
+source("scripts/taxaLabels_species_level.R")
 fungi.tax$taxa_labels <- taxaLabels(fungi.tax)
 # remove NAs
 fungi.tax[is.na(fungi.tax)] <- ""
@@ -769,15 +769,15 @@ fungi <- floor(fungi)
 # 
 # write.table(funguild, "funguild_otu_table.txt", quote = F, sep = "\t")
 # 
-# test <- read.table("/Users/sonya.erlandson/Documents/funguild_otu_table.txt", sep = "\t")
+# test <- read.table("funguild_otu_table.txt", sep = "\t")
 
-funguild <- read.table("/Users/sonya.erlandson/OneDrive - USDA/greenhouse crop identity 2022/data tables/ITS/funguild_otu_table.guilds_matched.txt", 
+funguild <- read.table("data tables/ITS/funguild_otu_table.guilds_matched.txt", 
                        sep = "\t", 
                        header = T)
 
 guilds <- funguild[,c(1,72:81)]
 
-fungi.tax.ref <- read.csv("/Users/sonya.erlandson/OneDrive - USDA/greenhouse crop identity 2022/data tables/ITS/fungi_reformatted_taxonomy.csv")
+fungi.tax.ref <- read.csv("data tables/ITS/fungi_reformatted_taxonomy.csv")
 
 ```
 
