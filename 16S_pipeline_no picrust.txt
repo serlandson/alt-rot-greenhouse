@@ -1,0 +1,137 @@
+###############################################################################################
+#!/bin/bash
+#SBATCH --job-name=process16S
+#SBATCH --nodes=1
+#SBATCH --time=3:00:00
+#SBATCH --output=process16S_%a.out
+#SBATCH --error=process16S_%a.err
+#SBATCH --partition short
+#SBATCH --array=1-10
+
+ml load miniconda
+source activate ampenv
+
+# rename reads
+#for f in *R1*.fastq.gz; do mv $f ${f/_S*_L001_R1_001/_F}; done # forward reads
+#for f in *R2*.fastq.gz; do mv $f ${f/_S*_L001_R2_001/_R}; done # reverse reads
+
+# merge pairs and trim ends
+for i in *${SLURM_ARRAY_TASK_ID}_16S_F.fastq.gz; 
+	do SAMPLE=${i/_F.fastq.gz/}; 
+	echo ${SAMPLE};
+	cutadapt -g GACTACHVGGGTATCTAATCC -rc -o ${SAMPLE}_R_primertrimmed.fastq ${SAMPLE}_R.fastq.gz; 
+	vsearch --fastq_mergepairs ${SAMPLE}_F.fastq.gz --rev ${SAMPLE}_R_primertrimmed.fastq --fastqout ${SAMPLE}_merged.fastq --fastqout_notmerged_fwd ${SAMPLE}_F_nomerge.fastq --fastq_maxdiffs 10 --fastq_allowmergestagger; 
+	cat ${SAMPLE}_F_nomerge.fastq >> ${SAMPLE}_merged.fastq;
+	vsearch --fastx_filter ${SAMPLE}_merged.fastq --fastqout ${SAMPLE}_filtered.fastq --fastq_stripleft 36 --fastq_trunclen 270 --fastq_maxns 0; done
+
+
+ml load r/4.3.0
+
+Rscript --vanilla rscripts/16S_dada2.R
+
+# make sure file path matches location of filtered reads in rscript
+
+###########################################################################
+# dada2 r script
+
+library(dada2)
+library(seqinr)
+
+filtpath <- "./16S"
+filts <- list.files(filtpath, pattern="16S_filtered.fastq", full.names=TRUE) ## CHANGE TO REP NUMBER
+sample.names <- sapply(strsplit(basename(filts), "_"), `[`, 1) # Assumes filename = sample_XXX.fastq.gz
+names(filts) <- sample.names
+
+# Learn error rates
+set.seed(100)
+err <- learnErrors(filts, nbases = 1e8, multithread=TRUE, randomize=TRUE)
+dadas <- dada(filts, err = err, multithread = TRUE)
+seqtab <- makeSequenceTable(dadas)
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+
+# Assign taxonomy https://zenodo.org/record/4310151 
+taxa <- assignTaxonomy(seqtab.nochim, "rdp_train_set_18.fa.gz", multithread=TRUE, tryRC=TRUE)
+taxa <- addSpecies(taxa, "rdp_species_assignment_18.fa.gz", tryRC=TRUE)
+
+# add fasta file and renamed headers
+asv_names <- paste("ASV", 1:length(row.names(taxa)), sep = "_") #make new row names
+asv_seqs <- as.character(row.names(taxa))
+#create fasta of ASV sequences
+asv_seqs <- data.frame(asv_names, asv_seqs)
+#write fasta
+write.fasta(as.list(asv_seqs$asv_seqs), asv_names, file.out = "./16S/output/asv_seqs_16S.fasta", nbchar = max(nchar(asv_seqs$asv_seqs)))
+
+#change row and column names from sequences to number ASV names and save
+row.names(taxa) <- asv_names # change row names of taxonomy table
+colnames(seqtab.nochim) <- asv_names # change column names of ASV table
+write.csv(seqtab.nochim, "./16S/output/asv_table_16S.csv", quote = F)
+write.csv(taxa, "./16S/output/taxonomy_16S.csv", quote = F)
+
+
+## filter ASV table to remove plant stuff
+bacteria <- read.csv("asv_table_16S.csv", row.names = 1)
+bacteria.tax <- read.csv("taxonomy_16S.csv")
+bacteria.fasta <- read.fasta("asv_seqs_16S.fasta", as.string = T, forceDNAtolower = F)
+samples <- read.csv("sampledata.csv")
+
+# remove chloroplasts
+keeptax <- grep("Chloroplast", bacteria.tax$Phylum, invert = T)
+bacteria.tax <- bacteria.tax[keeptax, ] # these are chloroplasts
+bacteria <- bacteria[,keeptax] # chloroplast
+bacteria.fasta <- bacteria.fasta[keeptax]
+## get samples and otu table in the same order.
+bacteria <- bacteria[match(samples$idmatch,row.names(bacteria)), ] 
+write.csv(bacteria, "filtered_asv_table_16S.csv", quote = F)
+write.csv(bacteria.tax, "filtered_asv_taxonomy_16S.csv", quote = F)
+write.fasta(bacteria.fasta, names = names(bacteria.fasta), file.out = "filtered_asv_seqs_16S.fasta")
+
+# I converted the csv ASV table to biom in R using the biomformat package (biomV100)
+# I loaded the biom table and sequences in to qiime to convert them to .qza files
+R
+library(biomformat)
+asv<-read.csv("filtered_asv_table_16S.csv", row.names=1)
+biomasv<-make_biom(t(asv))
+write_biom(biomasv, "filtered_asv_table_16S.biom")
+
+#############################################################################
+###########################################################################
+# greengenes2 in qiime2 - version 2023-7
+qiime2
+# import asv table in to qiime format
+qiime tools import --type FeatureTable[Frequency] --input-path filtered_asv_table_16S.biom --input-format BIOMV100Format --output-path filtered_asv_table_16S.qza
+
+# import sequence fasta in to qiime format
+qiime tools import --type FeatureData[Sequence] --input-path filtered_asv_seqs_16S.fasta --output-path filtered_asv_seqs_16S.qza
+	
+
+# download full length 16S backbone tree to do closed reference OTU picking 
+wget http://ftp.microbio.me/greengenes_release/2022.10/2022.10.backbone.full-length.fna.qza
+# download taxonomy
+wget http://ftp.microbio.me/greengenes_release/2022.10/2022.10.taxonomy.asv.nwk.qza
+# download phylogeny
+wget http://ftp.microbio.me/greengenes_release/2022.10/2022.10.phylogeny.asv.nwk.qza
+
+
+# closed reference OTU picking with GG2 sequences. recommended. looks fine. This makes 99% otus!!
+# goes from about 30,000 ASVs to 2300 OTUS. 
+# maps sequences to greengenes2 db using vsearch
+# input is ASV table and sequences
+qiime greengenes2 non-v4-16s --i-table filtered_asv_table_16S.qza --i-sequences filtered_asv_seqs_16S.qza --i-backbone gg2_refs/2022.10.backbone.full-length.fna.qza --p-threads 4 --o-mapped-table otu_table_gg2_biom.qza --o-representatives otu_seqs_gg2.fna.qza
+
+# find taxonomy from taxonomy table and feature table sequences
+qiime greengenes2 taxonomy-from-table --i-reference-taxonomy gg2_refs/2022.10.taxonomy.asv.nwk.qza --i-table otu_table_gg2_biom.qza --o-classification otu_taxonomy_gg2.qza
+
+# get faiths phylogenetic diversity
+qiime diversity-lib faith-pd --i-table otu_table_gg2_biom.qza --i-phylogeny gg2_refs/2022.10.phylogeny.asv.nwk.qza --o-vector faith_pd_16s.qza
+
+# get weighted unifrac matrix
+qiime diversity-lib weighted-unifrac --i-table otu_table_gg2_biom.qza --i-phylogeny gg2_refs/2022.10.phylogeny.asv.nwk.qza --p-threads auto --o-distance-matrix weighted_unifrac_16S.qza
+
+# get a tab file matching otu (asv) id, sequence, and taxonomic assignment
+qiime metadata tabulate --m-input-file otu_taxonomy_gg2.qza --m-input-file otu_seqs_gg2.fna.qza --o-visualization classified_otu_tax_seqs_matched
+ # unzip and get the metadata.tsv file  
+
+# get tab separated otu table 
+biom convert -i feature-table.biom -o otu_table_16S_gg2.tsv --to-tsv
+
+qiime phylogeny filter-tree --i-tree gg2_refs/2022.10.phylogeny.asv.nwk.qza --i-table otu_table_gg2_biom.qza --o-filtered-tree otu_phylogeny_16S.nwk.qza
