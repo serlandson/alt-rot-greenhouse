@@ -1,5 +1,5 @@
 ########################################
-# FINAL PIPELINE
+# ITS1 PIPELINE
 #########################################
 
 #!/bin/bash
@@ -54,10 +54,4 @@ vsearch --sortbysize all_97_otus_nonchim.fasta --output otus_filtered.fasta --si
 vsearch --usearch_global all.fasta --threads 72 --db all_97_otus_nonchim.fasta --id 0.97 --sizein --sizeout --fasta_width 0 --otutabout otu_table_its1_97.txt
 
 # assign taxonomy
-vsearch --sintax all_97_otus_nonchim.fasta --db ../unite_9_eukaryotes.fasta --randseed 44 --sintax_cutoff 0.9 --tabbedout taxonomy_otus.txt
-
-# run ITSx for TBAS and filter to fungi only.
-ITSx -i all_97_otus_nonchim.fasta -o all_97_otus_nonchim_ITSx.fasta -t "fungi"
-
-# remove otu size info for TBAS
-cut -d\; -f1 all_97_otus_nonchim_ITSx.fasta.ITS1.fasta > fungi_97_otus_ITS1_nosize.fasta
+vsearch --sintax all_97_otus_nonchim.fasta --db ../unite_9_eukaryotes.fasta --randseed 44 --sintax_cutoff 0.6 --tabbedout taxonomy_otus.txt
