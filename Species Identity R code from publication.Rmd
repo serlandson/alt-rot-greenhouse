@@ -126,7 +126,7 @@ bac.taxa.names <- data.frame(gsub(pattern = "[dpocfgs]__",
                                   replacement = "", bac.taxa.names))
 colnames(bac.taxa.names) <- c("taxonomy") # remove taxonomy formatting
 
-source("scripts/taxaLabels_for_gg2_16S.R")
+source("taxaLabels_for_gg2_16S.R")
 
 bac.taxa.names <- separate(bac.taxa.names, 
                            col = taxonomy, 
@@ -746,7 +746,7 @@ fungi.tax <- all.tax[str_detect(pattern = "Fungi",
                                 negate = F) & as.numeric(all.tax$size) >1 , ] # get fungi with size >=2
 
 # add taxa labels
-source("scripts/taxaLabels_species_level.R")
+source("taxaLabels_species_level.R")
 fungi.tax$taxa_labels <- taxaLabels(fungi.tax)
 # remove NAs
 fungi.tax[is.na(fungi.tax)] <- ""
