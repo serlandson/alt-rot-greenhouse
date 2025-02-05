@@ -1,0 +1,2002 @@
+---
+title: "R Notebook"
+output: html_notebook
+chunk_output_type: console
+---
+  
+  
+This greenhouse experiment tests the influence of a plant species on the
+rhizosphere community of a subsequently grown plant species. The species
+tested were sunflower, pea, soybean, and maize on maize rhizosphere
+communities and spring wheat, maize, soybean on soybean rhizosphere
+communities
+
+#Load libraries
+```{r, message = FALSE, echo=FALSE}
+
+library(vegan)
+library(pairwiseAdonis)
+library(tidyverse)
+library(multcomp)
+library(hillR)
+library(tibble)
+library(magrittr)
+library(ggpubr)
+library(knitr)
+library(GUniFrac)
+library(multcompView)
+library(emmeans)
+library(WGCNA)
+library(NetCoMi)
+library(zCompositions)
+library("colorspace")
+library(khroma)
+library(viridis)
+library(rstatix)
+library(patchwork)
+
+set.seed(44)
+```
+
+#Load Data
+
+```{r, load data}
+
+samples <- read.csv("/Users/sonya.erlandson/OneDrive - USDA/greenhouse crop identity 2022/data tables/all_sample_data.csv", 
+                    stringsAsFactors = F, 
+                    row.names = 1)
+
+samples$resp_spp <- factor(samples$resp_spp, 
+                           labels = c("Maize", "Soybean"))
+samples$cond_spp <- factor(samples$cond_spp, 
+                           labels = c("Maize", "Pea", "Soybean", "Spring Wheat", "Sunflower"))
+
+
+maizesamp <- samples[samples$resp_spp=="Maize", ]
+maizesamp <- droplevels(maizesamp)
+maize.cond <- maizesamp$cond_spp
+
+soybeansamp <- samples[samples$resp_spp=="Soybean", ]
+soybeansamp <- droplevels(soybeansamp)
+soybean.cond <- soybeansamp$cond_spp
+
+speciescolors <- c("Maize" = "#CCBB44", "Pea" = "#228833", "Soybean" = "#AA3377","Spring Wheat" = "#4477AA", "Sunflower"= "#EE6677")
+
+```
+
+#Load Functions
+```{r, aggregation function}
+
+#how to use: need 1) otu table with samples as rows, taxa as columns
+#                 2) a character vector of taxonomy level classifications that matches the taxa in otu table columns 
+#-- should be the Kingdom, Phylum...etc column from taxonomy table.
+# will return an otu table with taxa summed at the given taxonomic level.
+# row names will be sample names and colnames will be same as taxonomy vector, plus one column of sample names for pivoting
+
+aggregate_by_tax_level <- function(otu.table, taxonomy.vector){
+  newOtuTable <- aggregate(t(otu.table), list(taxonomy.vector), FUN = sum)
+  row.names(newOtuTable) <- newOtuTable$Group.1
+  newOtuTable <- newOtuTable[ ,-1]
+  newOtuTable <- as.data.frame(t(newOtuTable))
+  
+}
+```
+
+make data subsets
+define functions
+```{r, subset functions}
+# need subsets - filter by abundance and prevalence
+# cond_spp is a true/false vector of samples to keep
+make_subsets_cond <- function(comm, cond_spp, minsamp){
+  commcond <- comm[cond_spp, ]
+  commfilt <- commcond[,colnames(commcond) %in% names(sort(colSums(commcond),decreasing=T)[1:floor(ncol(commcond)*0.1)])]
+  commfilt <- commfilt[,colSums(decostand(commfilt, method = "pa"))>=minsamp]
+}
+
+#filter by abundance and prevalence top 10% of ASVs by abundance and present in 10% of samples
+make_subsets <- function(comm, minsamp){
+  commfilt <- comm[,colnames(comm) %in% names(sort(colSums(comm),decreasing=T)[1:floor(ncol(comm)*0.1)])]
+  commfilt <- commfilt[,colSums(decostand(commfilt, method = "pa"))>=minsamp]
+}
+
+```
+
+
+#16S
+###Load OTU tables
+Greengenes classified data - 99% OTUS
+
+qPCR data
+
+```{r}
+### These are 99% OTUs with taxonomy assigned from the gg2 phylogeny/taxonomy
+bacteria <- read.table("/Users/sonya.erlandson/OneDrive - USDA/greenhouse crop identity 2022/data tables/16S/greengenes2/otu_table_16S_gg2.tsv", 
+                       sep = "\t", 
+                       row.names = 1, 
+                       header = T)
+
+bacteria <- as.data.frame(t(bacteria))
+
+bacteria.tax <- read.table("/Users/sonya.erlandson/OneDrive - USDA/greenhouse crop identity 2022/data tables/16S/greengenes2/taxonomy.tsv", 
+                           sep = "\t", 
+                           header = T)
+
+bac.taxa.names <- bacteria.tax$Taxon
+bac.taxa.names <- data.frame(gsub(pattern = "[dpocfgs]__", 
+                                  replacement = "", bac.taxa.names))
+colnames(bac.taxa.names) <- c("taxonomy") # remove taxonomy formatting
+
+source("/Users/sonya.erlandson/OneDrive - USDA/greenhouse crop identity 2022/scripts/taxaLabels_for_gg2_16S.R")
+
+bac.taxa.names <- separate(bac.taxa.names, 
+                           col = taxonomy, 
+                           into = c("kingdom", "phylum", "class", "order", "family", "genus", "species"), 
+                           sep = "; ")
+
+bacteria.tax <- cbind(bacteria.tax, bac.taxa.names)
+bacteria.tax$taxa_labels <- taxaLabels(bac.taxa.names)
+bacteria.tax <- bacteria.tax[match(colnames(bacteria), bacteria.tax$Feature.ID), ]
+
+# make sure the row names will work with phyloseq
+row.names(bacteria.tax) <- bacteria.tax$Feature.ID
+
+# qPCR corrected bacteria dataset
+bacteria.qpcr <- floor((bacteria/rowSums(bacteria)) * samples$V3V4_CN_per_sample)
+
+```
+
+####Sample rarefaction and species accumulation
+```{r}
+rarecurve(bacteria, step = 100)
+# looks good
+
+```
+####Spec accum plot
+```{r}
+plot(specaccum(bacteria))
+# species accumulation curve is just starting to plateau
+```
+
+
+####Diversity
+This calculates diversity for all samples (maize and soybean)
+```{r, calculate diversity}
+#need to calculate diversity at each level
+# this is with qPCR corrected data
+# need to reduce size because the rarefaction takes forever with the sample size of 9 million
+bac.qpcr.rar <- rrarefy(floor(bacteria.qpcr/10000), 
+                        sample = min(rowSums(floor(bacteria.qpcr/10000))))
+
+
+bac.div.table <- data.frame(cond_spp=factor(samples$cond_spp),
+                            q0=hill_taxa(bac.qpcr.rar, q=0), 
+                            q1=hill_taxa(bac.qpcr.rar, q=1),
+                            q2=hill_taxa(bac.qpcr.rar, q=2))
+
+bac.div.table$SPAD <- samples$SPAD.mean3
+bac.div.table$log_V3V4_counts <- samples$logV3V4CopyNumber
+
+```
+
+#16S maize
+
+subset maize data
+
+```{r}
+bac.maize.comm <- bacteria[samples$resp_spp=="Maize",
+                           colSums(bacteria[samples$resp_spp=="Maize", ])>0]
+
+
+
+#filter tree
+#bac.maize.tree <- ape::keep.tip(bac.tree, colnames(bac.maize.comm))
+
+# filter qpcr data
+bac.maize.qpcr <- bacteria.qpcr[samples$resp_spp=="Maize", 
+                                colSums(bacteria.qpcr[samples$resp_spp=="Maize", ])>0]
+
+# filter taxonomy
+bac.maize.tax <- bacteria.tax[bacteria.tax$Feature.ID %in% colnames(bac.maize.qpcr),]
+
+plot(specaccum(bac.maize.comm))
+```
+
+Test for differences between preceding species treatments on biomass, diversity, etc.
+
+Calculate diversity for each sample to test the effect of diversity on
+seedling biomass and spad.
+
+Test if treatment changes biomass
+
+### biomass
+
+```{r}
+bartlett.test(maizesamp$response.dry.mass.g ~ maize.cond)
+hist(maizesamp$response.dry.mass.g)
+# ANOVA
+bac.maize.biomass.aov <- aov(maizesamp$response.dry.mass.g ~ maize.cond)
+# Summary of the analysis
+summary(bac.maize.biomass.aov)
+summary(glht(bac.maize.biomass.aov, 
+             linfct = mcp(maize.cond = "Tukey")))
+
+bac.maize.biomass.tukey <- TukeyHSD(bac.maize.biomass.aov)
+
+mcl <- multcompLetters4(bac.maize.biomass.aov, bac.maize.biomass.tukey)$maize.cond$Letters
+
+plotlabels <- data.frame(x = c("Maize", "Pea", "Soybean", "Sunflower"), 
+                         y = unlist(lapply(split(maizesamp$response.dry.mass.g, maizesamp$cond_spp), FUN = max)), 
+                         labels = c(mcl[4],mcl[1],mcl[2],mcl[3]))
+
+# add overall anova pvalue to plot and add tukey tests that are significant
+
+bac.maize.biomass.plot <- ggplot(maizesamp, 
+                                 aes(x = cond_spp, 
+                                     y = response.dry.mass.g))+
+  geom_boxplot(aes(x = cond_spp, 
+                   y = response.dry.mass.g))+
+  geom_point(aes(alpha = 0.7))+
+  geom_text(data = plotlabels, 
+            aes(x = x, y = y, label = labels), 
+            nudge_y = 0.02)+
+  labs(x = "Preceding species", 
+       y = "Maize shoot dry mass (gram)", 
+       tag = "A")+
+  theme_bw()+
+theme(axis.text = element_text(size = 10, color = "black"), 
+        axis.title = element_text(size = 10),
+        legend.position = "none")+
+  annotate('text', "Sunflower", 0.13, 
+           label="ANOVA~italic(p)==4.9%*%10^-4", 
+           parse=TRUE, hjust = 0.7, size=3)
+
+
+bac.maize.biomass.plot
+
+```
+
+###spad
+
+```{r}
+bartlett.test(maizesamp$SPAD.mean3 ~ maize.cond)
+hist(maizesamp$response.dry.mass.g)
+
+# ANOVA
+bac.maize.spad.aov <- aov(maizesamp$SPAD.mean3 ~ maize.cond)
+# Summary of the analysis
+summary(bac.maize.spad.aov)
+summary(glht(bac.maize.spad.aov, linfct = mcp(maize.cond = "Tukey")))
+
+bac.maize.spad.tukey <- TukeyHSD(bac.maize.spad.aov)
+
+mcl <- multcompLetters4(bac.maize.spad.aov, bac.maize.spad.tukey)$maize.cond$Letters
+
+plotlabels <- data.frame(x = c("Maize", "Pea", "Soybean", "Sunflower"), y = unlist(lapply(split(maizesamp$SPAD.mean3, maizesamp$cond_spp), FUN = max)), labels = c(mcl[4],mcl[1],mcl[2],mcl[3]))
+
+# add overall anova pvalue to plot and add tukey tests that are significant
+
+bac.maize.spad.plot <- ggplot(maizesamp, aes(x = cond_spp, y = SPAD.mean3))+
+  geom_boxplot(aes(x = cond_spp, y = SPAD.mean3))+
+  geom_point(aes(alpha = 0.7))+
+  geom_text(data = plotlabels, aes(x = x, y = y, label = labels), nudge_y = 1.5)+
+  labs(x = "Preceding species", 
+       y = "Maize SPAD", 
+       tag = "B")+
+  theme_bw()+
+  theme(axis.text = element_text(size = 10, color = "black"), 
+        axis.title = element_text(size = 10),
+        legend.position = "none")+
+  annotate('text', "Sunflower", 16, 
+           label=("ANOVA~italic(p)==5.4%*%10^-6"), 
+           parse=TRUE, hjust = 0.7, size=3)
+ 
+bac.maize.spad.plot
+
+```
+
+### copy number
+
+```{r}
+bartlett.test(maizesamp$logV3V4CopyNumber ~ maize.cond)
+hist(maizesamp$logV3V4CopyNumber)
+
+# ANOVA
+CN.bac.maize.aov <- aov(maizesamp$logV3V4CopyNumber ~ maize.cond)
+# Summary of the analysis
+summary(CN.bac.maize.aov)
+summary(glht(CN.bac.maize.aov, 
+             linfct = mcp(maize.cond = "Tukey")))
+
+bac.maize.CN.tukey <- TukeyHSD(CN.bac.maize.aov)
+
+mcl <- multcompLetters4(CN.bac.maize.aov, bac.maize.CN.tukey)$maize.cond$Letters
+
+plotlabels <- data.frame(x = c("Maize", "Pea", "Soybean", "Sunflower"), 
+                         y = unlist(lapply(split(maizesamp$logV3V4CopyNumber, maizesamp$cond_spp), FUN = max)), 
+                         labels = c(mcl[4],mcl[2],mcl[3],mcl[1]))
+
+# add overall anova pvalue to plot and add tukey tests that are significant
+
+CN.bac.maize <- ggplot(maizesamp, 
+                       aes(x = cond_spp, 
+                           y = logV3V4CopyNumber))+
+  geom_boxplot(aes(x = cond_spp, 
+                   y = logV3V4CopyNumber))+
+  geom_point(aes(alpha = 0.7))+
+  geom_text(data = plotlabels, 
+            aes(x = x, 
+                y = y, 
+                label = labels), 
+            nudge_y = 0.15)+
+  labs(x = "Preceding species", 
+       y = expression(paste("16S gene copies (", g^-1, "wet root mass)")),
+       tag = "E")+
+  theme_bw()+
+  theme(axis.text = element_text(size = 10, color = "black"), 
+        axis.title = element_text(size = 10),
+        legend.position = "none")+
+  annotate('text', "Sunflower", 8.7, 
+           label="ANOVA~italic(p)==8.7%*%10^-9", 
+           parse=TRUE, hjust = 0.7, size=3)
+
+
+CN.bac.maize
+
+```
+
+### diversity
+
+```{r}
+bac.maize.div.table <- bac.div.table[samples$resp_spp == "Maize", ]
+
+lapply(split(bac.maize.div.table$q1, bac.maize.div.table$cond_spp), FUN = mean)
+
+bartlett.test(bac.maize.div.table$q1 ~ maize.cond)
+hist(bac.maize.div.table$q1)
+
+# ANOVA
+bac.maize.diversity.aov <- aov(bac.maize.div.table$q1 ~ maize.cond)
+# Summary of the analysis
+summary(bac.maize.diversity.aov)
+summary(glht(bac.maize.diversity.aov, 
+             linfct = mcp(maize.cond = "Tukey")))
+
+bac.maize.diversity.tukey <- TukeyHSD(bac.maize.diversity.aov)
+
+mcl <- multcompLetters4(bac.maize.diversity.aov, bac.maize.diversity.tukey)$maize.cond$Letters
+
+plotlabels <- data.frame(x = c("Maize", "Pea", "Soybean", "Sunflower"),
+                         y = unlist(lapply(split(bac.maize.div.table$q1, maizesamp$cond_spp), FUN = max)), 
+                         labels = c(mcl[4],mcl[1],mcl[3],mcl[2]))
+
+# add overall anova pvalue to plot and add tukey tests that are significant
+bac.maize.diversity.plot <- ggplot(bac.maize.div.table, 
+                                   aes(x = cond_spp, 
+                                       y = q1))+
+  geom_boxplot(aes(x = cond_spp, 
+                   y = q1))+
+  geom_point(aes(alpha = 0.7))+
+  geom_text(data = plotlabels, 
+            aes(x = x, 
+                y = y, 
+                label = labels), 
+            nudge_y = 25)+
+  labs(x = "Preceding species", 
+       y = expression(paste("Bacterial diversity (Hill's ", italic(q)," = 1)")), 
+       tag = "C")+
+  theme_bw()+
+  theme(axis.text = element_text(size = 10, color = "black"), 
+        axis.title = element_text(size = 10),
+        legend.position = "none")+
+  annotate('text', "Sunflower", 130, 
+           label="ANOVA~italic(p)==4.7%*%10^-6", 
+           parse=TRUE, hjust = 0.7, size=3)
+
+
+bac.maize.diversity.plot
+
+```
+
+### beta diversity
+
+Does preceding crop alter maize rhizosphere community composition? In
+the field study, bacterial communities were different between rotations.
+
+treatment explains 27% of the variance in microbial community
+
+```{r}
+# check community dispersions across treatment
+
+bac.maize.betadisper <- betadisper(d = vegdist(bac.maize.qpcr, 
+                                               method = "bray"), 
+                                   group = maizesamp$cond_spp, 
+                                   sqrt.dist = T)
+anova(bac.maize.betadisper)
+# groups have VERY equal dispersion. perfect.
+
+# permanova/rda to test difference between groups
+# CLR transform community data.
+
+# test
+bac.maize.permanova <- adonis2(bac.maize.qpcr~cond_spp, 
+                               data = maizesamp, 
+                               method = "bray", 
+                               by = "terms")
+
+bac.maize.pairedanova <- pairwise.adonis2(bac.maize.comm~cond_spp, 
+                                          data = maizesamp, 
+                                          method = "bray")
+
+bac.maize.permanova
+lapply(bac.maize.pairedanova, FUN = kable)
+
+```
+
+make binary treatment vectors - need these for network analysis
+```{r}
+#make binary treatment vectors
+# make new columns for treatments
+maizesamp$maize.pea <- as.character(maizesamp$cond_spp)
+maizesamp$maize.pea[maizesamp$maize.pea != "Pea"] <- 0
+maizesamp$maize.pea[maizesamp$maize.pea == "Pea"] <- 1
+
+maizesamp$maize.sunflower <- as.character(maizesamp$cond_spp)
+maizesamp$maize.sunflower[maizesamp$maize.sunflower != "Sunflower"] <- 0
+maizesamp$maize.sunflower[maizesamp$maize.sunflower == "Sunflower"] <- 1
+
+maizesamp$maize.soybean <- as.character(maizesamp$cond_spp)
+maizesamp$maize.soybean[maizesamp$maize.soybean != "Soybean"] <- 0
+maizesamp$maize.soybean[maizesamp$maize.soybean == "Soybean"] <- 1
+
+maizesamp$maize.maize <- as.character(maizesamp$cond_spp)
+maizesamp$maize.maize[maizesamp$maize.maize != "Maize"] <- 0
+maizesamp$maize.maize[maizesamp$maize.maize == "Maize"] <- 1
+```
+
+
+#16S soybean
+
+subset soybean data
+
+```{r}
+bac.soybean.comm <- bacteria[samples$resp_spp=="Soybean", 
+                             colSums(bacteria[samples$resp_spp=="Soybean", ])>0]
+
+bac.soybean.qpcr<- bacteria.qpcr[samples$resp_spp=="Soybean", 
+                                 colSums(bacteria.qpcr[samples$resp_spp=="Soybean", ])>0]
+```
+
+diversity - subset from table
+
+```{r}
+#need to calculate diversity at each level
+bac.soybean.div.table <- bac.div.table[row.names(bac.div.table) %in% row.names(bac.soybean.qpcr), ]
+```
+
+Treatment Effects
+
+Calculate diversity for each sample to test the effect of diversity on
+seedling biomass
+
+Test if treatment changes biomass 
+### biomass
+
+```{r}
+bartlett.test(soybeansamp$response.dry.mass.g ~ soybean.cond)
+hist(soybeansamp$response.dry.mass.g)
+
+# ANOVA
+bac.soybean.biomass.aov <- aov(soybeansamp$response.dry.mass.g ~ soybean.cond)
+# Summary of the analysis
+summary(bac.soybean.biomass.aov)
+summary(glht(bac.soybean.biomass.aov, 
+             linfct = mcp(soybean.cond = "Tukey")))
+
+bac.soybean.biomass.tukey <- TukeyHSD(bac.soybean.biomass.aov)
+
+mcl <- multcompLetters4(bac.soybean.biomass.aov, bac.soybean.biomass.tukey)$soybean.cond$Letters
+
+plotlabels <- data.frame(x = c("Maize", "Soybean", "Spring Wheat"), 
+                         y = unlist(lapply(split(soybeansamp$response.dry.mass.g, soybeansamp$cond_spp), FUN = max)), 
+                         labels = c(mcl[3],mcl[1],mcl[2]))
+
+
+bac.soybean.biomass.plot <- ggplot(soybeansamp, 
+                                   aes(x = cond_spp, 
+                                       y = response.dry.mass.g))+
+  geom_boxplot(aes(x = cond_spp, 
+                   y = response.dry.mass.g))+
+  geom_point(aes(alpha = 0.7))+
+  geom_text(data = plotlabels, 
+            aes( x = x, 
+                 y = y, 
+                 label = labels), 
+            nudge_y = 0.01)+
+  labs(x = "Preceding species", 
+       y = "Soybean shoot dry mass (gram)", 
+       tag = "A")+
+  theme_bw()+
+  theme(axis.text = element_text(size = 10, color = "black"), 
+        axis.title = element_text(size = 10),
+        legend.position = "none")+
+  annotate('text', "Spring Wheat", 0.13, 
+           label="ANOVA~italic(p)==0.041", 
+           parse=TRUE, hjust = 0.7, size=3)
+ 
+bac.soybean.biomass.plot
+```
+
+###spad
+
+```{r}
+# ANOVA
+bac.soybean.spad.aov <- aov(soybeansamp$SPAD.mean3 ~ soybean.cond)
+# Summary of the analysis
+summary(bac.soybean.spad.aov)
+summary(glht(bac.soybean.spad.aov, linfct = mcp(soybean.cond = "Tukey")))
+
+bac.soybean.spad.tukey <- TukeyHSD(bac.soybean.spad.aov)
+
+mcl <- multcompLetters4(bac.soybean.spad.aov, bac.soybean.spad.tukey)$soybean.cond$Letters
+
+plotlabels <- data.frame(x = c("Maize", "Soybean", "Spring Wheat"), y = unlist(lapply(split(soybeansamp$SPAD.mean3, soybeansamp$cond_spp), FUN = max)), labels = c(mcl[3],mcl[1],mcl[2]))
+
+bac.soybean.spad.plot <- ggplot(soybeansamp, aes(x = cond_spp, y = SPAD.mean3))+
+  geom_boxplot(aes(x = cond_spp, y = SPAD.mean3))+
+  geom_point(aes(alpha = 0.7))+
+  #geom_text(data = plotlabels, aes( x= x, y = y, label = labels), nudge_y = 0.7)+
+  #ylim(27,38)+
+  labs(x = "Preceding species", 
+       y = "Soybean SPAD", 
+       tag = "B")+
+  theme_bw()+
+  theme(axis.text = element_text(size = 10, color = "black"), 
+        axis.title = element_text(size = 10),
+        legend.position = "none")+
+  annotate('text', "Maize", 27.8, 
+           label="ANOVA~italic(p)==0.15", 
+           parse=TRUE, hjust = 0.3, size=3)
+  
+
+bac.soybean.spad.plot
+```
+
+
+### diversity
+
+```{r}
+bartlett.test(bac.div.table$q1[samples$resp_spp == "Soybean"] ~ soybean.cond)
+hist(bac.div.table$q1[samples$resp_spp == "Soybean"])
+
+# ANOVA
+bac.soybean.diversity.aov <- aov(bac.div.table$q1[samples$resp_spp == "Soybean"] ~ soybean.cond)
+# Summary of the analysis
+summary(bac.soybean.diversity.aov)
+summary(glht(bac.soybean.diversity.aov, 
+             linfct = mcp(soybean.cond = "Tukey")))
+
+bac.soybean.diversity.tukey <- TukeyHSD(bac.soybean.diversity.aov)
+
+mcl <- multcompLetters4(bac.soybean.diversity.aov, bac.soybean.diversity.tukey)$soybean.cond$Letters
+
+plotlabels <- data.frame(x = c("Maize", "Soybean", "Spring wheat"), 
+                         y = unlist(lapply(split(bac.soybean.div.table$q1, soybeansamp$cond_spp), FUN = max)), 
+                         labels = c(mcl[3],mcl[1],mcl[2]))
+
+bac.soybean.diversity.plot <- ggplot(bac.soybean.div.table, 
+                                     aes(x = cond_spp, 
+                                         y = q1))+
+  geom_boxplot(aes(x = cond_spp, 
+                   y = q1))+
+  geom_point(aes(alpha = 0.7))+
+  #geom_text(data = plotlabels, 
+  # aes( x= x, 
+  #      y = y, 
+  #      label = labels), 
+  # nudge_y = 20)+
+  labs(x = "Preceding species", 
+       y = expression(paste("Bacterial diversity (Hill's ", italic(q)," = 1)")), 
+       tag = "C")+
+  theme_bw()+
+  theme(axis.text = element_text(size = 10, color = "black"), 
+        axis.title = element_text(size = 10),
+        legend.position = "none")+
+  annotate('text', "Spring Wheat", 160, 
+           label="ANOVA~italic(p)==0.059", 
+           parse=TRUE, hjust = 0.7, size=3)
+  
+bac.soybean.diversity.plot
+```
+
+### counts
+
+```{r}
+bartlett.test(soybeansamp$logV3V4CopyNumber ~ soybean.cond)
+hist(soybeansamp$logV3V4CopyNumber)
+
+# ANOVA
+CN.bac.soy.aov <- aov(soybeansamp$logV3V4CopyNumber ~ soybean.cond)
+# Summary of the analysis
+summary(CN.bac.soy.aov)
+summary(glht(CN.bac.soy.aov, 
+             linfct = mcp(soybean.cond = "Tukey")))
+
+bac.soybean.CN.tukey <- TukeyHSD(CN.bac.soy.aov)
+
+mcl <- multcompLetters4(CN.bac.soy.aov, bac.soybean.CN.tukey)$soybean.cond$Letters
+
+plotlabels <- data.frame(x = c("Maize", "Soybean", "Spring Wheat"), 
+                         y = unlist(lapply(split(soybeansamp$logV3V4CopyNumber, soybeansamp$cond_spp), FUN = max)), 
+                         labels = c(mcl[3],mcl[1],mcl[2]))
+
+
+CN.bac.soybean <- ggplot(soybeansamp, 
+                         aes(x = cond_spp, 
+                             y = logV3V4CopyNumber))+
+  geom_boxplot(aes(x = cond_spp, 
+                   y = logV3V4CopyNumber))+
+  geom_point(aes(alpha = 0.7))+
+  geom_text(data = plotlabels, 
+            aes(x = x, 
+                y = y, 
+                label = labels), 
+            nudge_y = 0.2)+
+  labs(x = "Preceding species", 
+       y = expression(paste("16S gene copies (", g^-1, "wet root mass)")), 
+       tag = "E")+
+  theme_bw()+
+  theme(axis.text = element_text(size = 10, color = "black"), 
+        axis.title = element_text(size = 10),
+        legend.position = "none")+
+  annotate('text', "Maize", 8.87, 
+           label="ANOVA~italic(p)==0.0025", 
+           parse=TRUE, hjust = 0.3, size=3)
+
+
+CN.bac.soybean
+```
+
+### beta diversity
+
+Does preceding crop alter soybean rhizosphere community composition? in
+the field study the bacterial rhizosphere communities did not differ
+between rotations.
+
+treatment explains 21% of community dissimilarity
+
+```{r}
+# permanova/rda to test difference between groups
+# CLR transform community data.
+
+bac.soybean.betadisper <- betadisper(d = vegdist(bac.soybean.qpcr), 
+                                     group = soybeansamp$cond_spp, 
+                                     sqrt.dist = T)
+anova(bac.soybean.betadisper) # great! good to use for permanova
+
+# test
+bac.soybean.permanova <- adonis2(bac.soybean.qpcr~cond_spp, 
+                                 data = soybeansamp, 
+                                 method = "bray", 
+                                 by = "terms")
+
+bac.soybean.pairedanova <- pairwise.adonis2(bac.soybean.qpcr~cond_spp, 
+                                            data = soybeansamp, 
+                                            method = "bray")
+bac.soybean.permanova
+bac.soybean.pairedanova 
+
+lapply(bac.soybean.pairedanova, FUN = kable)
+```
+
+
+make binary treatment vectors
+```{r}
+soybeansamp$soybean.maize <- as.character(soybeansamp$cond_spp)
+soybeansamp$soybean.maize[soybeansamp$soybean.maize != "Maize"] <- 0
+soybeansamp$soybean.maize[soybeansamp$soybean.maize == "Maize"] <- 1
+
+soybeansamp$soybean.soybean <- as.character(soybeansamp$cond_spp)
+soybeansamp$soybean.soybean[soybeansamp$soybean.soybean != "Soybean"] <- 0
+soybeansamp$soybean.soybean[soybeansamp$soybean.soybean == "Soybean"] <- 1
+
+soybeansamp$soybean.wheat <- as.character(soybeansamp$cond_spp)
+soybeansamp$soybean.wheat[soybeansamp$soybean.wheat != "Spring Wheat"] <- 0
+soybeansamp$soybean.wheat[soybeansamp$soybean.wheat == "Spring Wheat"] <- 1
+
+```
+
+
+#ITS1
+## Load and filter OTUs
+```{r}
+### These are 97% OTUs with taxonomy assigned from unite with sintax in vsearch. bootstrap cut off was 0.60.
+fungi <- read.table("/Users/sonya.erlandson/OneDrive - USDA/greenhouse crop identity 2022/data tables/ITS/otu_table_its1_97.txt", 
+                    sep = "\t", 
+                    header=T, 
+                    row.names = 1)
+
+all.tax <- read.table("/Users/sonya.erlandson/OneDrive - USDA/greenhouse crop identity 2022/data tables/ITS/taxonomy_otus.txt", 
+                      sep = "\t", 
+                      header = F)
+
+# fix taxonomy file formatting
+all.tax <- separate(all.tax, 
+                    col = V1, 
+                    into = c("otu_id", "size"), 
+                    sep = ";size=")
+all.tax <- all.tax[,-4] # remove this extra column
+all.tax$size <- as.numeric(all.tax$size)#make size numeric for sorting
+all.tax <- all.tax[order(all.tax$size, decreasing = T), ] # order by size
+all.tax$taxonomy <- gsub(pattern = "[dpocfgs]:", 
+                         replacement = "", 
+                         all.tax$V4 )# remove taxonomy formatting
+
+all.tax$taxonomy_sep <- gsub(pattern = "[dpocfgs]:", 
+                             replacement = "", 
+                             all.tax$V4 ) # make a column for separating into each level
+#all.tax$taxonomy_sep <- str_remove_all(all.tax$taxonomy_sep, pattern = "\\(....\\)")
+all.tax <- separate(all.tax, 
+                    col = taxonomy_sep, 
+                    into = c("kingdom", "phylum", "class", "order", "family", "genus", "species"), 
+                    sep = ",") # make each their own column
+
+# only keep fungi
+fungi.tax <- all.tax[str_detect(pattern = "Fungi", 
+                                string = all.tax$V4, 
+                                negate = F) & as.numeric(all.tax$size) >1 , ] # get fungi with size >=2
+
+# add taxa labels
+source("/Users/sonya.erlandson/OneDrive - USDA/greenhouse crop identity 2022/scripts/taxaLabels_species_level.R")
+fungi.tax$taxa_labels <- taxaLabels(fungi.tax)
+# remove NAs
+fungi.tax[is.na(fungi.tax)] <- ""
+
+# reorder taxa in otu table by size to match tax table
+fungi <- fungi[match(all.tax$otu_id, row.names(fungi)), ] # order by size
+
+summary(row.names(fungi)==all.tax$otu_id)
+
+fungi <- as.data.frame(t(fungi[,-1])) # transform otu table and remove extraction nc
+fungi <- as.data.frame(fungi[match(samples$idmatch, row.names(fungi)), ]) # get samples and otu table in the same order.
+fungi <- fungi[,colnames(fungi) %in% fungi.tax$otu_id]
+
+fungi.qpcr <- (fungi/rowSums(fungi))*samples$ITS1_CN_per_sample
+fungi <- floor(fungi)
+
+# make table for funguild - only once
+# funguild <- as.data.frame(t(fungi))
+# funguild$taxonomy <- fungi.tax$taxonomy
+# 
+# write.table(funguild, "funguild_otu_table.txt", quote = F, sep = "\t")
+# 
+# test <- read.table("/Users/sonya.erlandson/Documents/funguild_otu_table.txt", sep = "\t")
+
+funguild <- read.table("/Users/sonya.erlandson/OneDrive - USDA/greenhouse crop identity 2022/data tables/ITS/funguild_otu_table.guilds_matched.txt", 
+                       sep = "\t", 
+                       header = T)
+
+guilds <- funguild[,c(1,72:81)]
+
+fungi.tax.ref <- read.csv("/Users/sonya.erlandson/OneDrive - USDA/greenhouse crop identity 2022/data tables/ITS/fungi_reformatted_taxonomy.csv")
+
+```
+
+
+##species rarefaction and accumulation curves
+```{r}
+rarecurve(fungi, step = 100) # just enough sampling.
+```
+
+##spec accum plot
+```{r}
+plot(specaccum(fungi)) # looks ok, starting to plateau. enough sampling.
+```
+
+#ITS maize
+
+subset maize data
+
+```{r}
+fungi.maize.comm <- fungi[samples$resp_spp=="Maize", 
+                          colSums(fungi[samples$resp_spp=="Maize", ])>0]
+
+fungi.maize.qpcr <- fungi.qpcr[samples$resp_spp=="Maize",
+                               colSums(fungi.qpcr[samples$resp_spp=="Maize", ])>0]
+```
+
+##calc. diversity
+
+calculate diversity metrics for each preceding crop treatment
+
+```{r}
+#need to calculate diversity at each level
+fungi.maize.qpcr.rar <- rrarefy(floor(fungi.maize.qpcr/1000), sample = min(rowSums(floor(fungi.maize.qpcr/1000))))
+
+fungi.maize.div.table <- data.frame(cond_spp=factor(maizesamp$cond_spp),
+                                    q0=hill_taxa(fungi.maize.qpcr.rar, q=0),
+                                    q1=hill_taxa(fungi.maize.qpcr.rar, q=1),
+                                    q2=hill_taxa(fungi.maize.qpcr.rar, q=2))
+
+```
+
+## diversity
+
+```{r}
+bartlett.test(fungi.maize.div.table$q1 ~ maize.cond)
+hist(fungi.maize.div.table$q1)
+
+# ANOVA
+fungi.maize.diversity.aov <- aov(fungi.maize.div.table$q1 ~ maize.cond)
+# Summary of the analysis
+summary(fungi.maize.diversity.aov)
+summary(glht(fungi.maize.diversity.aov, linfct = mcp(maize.cond = "Tukey")))
+
+fungi.maize.diversity.tukey <- TukeyHSD(fungi.maize.diversity.aov)
+
+mcl <- multcompLetters4(fungi.maize.diversity.aov, fungi.maize.diversity.tukey)$maize.cond$Letters
+
+plotlabels <- data.frame(x = c("Maize", "Pea", "Soybean", "Sunflower"), 
+                         y = unlist(lapply(split(fungi.maize.div.table$q1, maizesamp$cond_spp), FUN = max)), 
+                         labels = c(mcl[4],mcl[1],mcl[2], mcl[3]))
+
+
+fungi.maize.diversity.plot <- ggplot(fungi.maize.div.table, 
+                                     aes(x = cond_spp, 
+                                         y = q1))+
+  geom_boxplot(aes(x = cond_spp, 
+                   y = q1))+
+  geom_point(aes(alpha = 0.7))+
+  # geom_text(data = plotlabels, 
+  #           aes(x = x, 
+  #               y = y, 
+  #               label = labels), 
+  #           nudge_y = 10)+
+  labs(x = "Preceding species", 
+       y = expression(paste("Fungal diversity (Hill's ", italic(q), " = 1)")), 
+       tag = "D")+
+  theme_bw()+
+  theme(axis.text = element_text(size = 10, color = "black"), 
+        axis.title = element_text(size = 10),
+        legend.position = "none")+
+  annotate('text', "Maize", 13, 
+           label="ANOVA~italic(p)==0.45", 
+           parse=TRUE, hjust = 0.4, size=3)
+  
+
+fungi.maize.diversity.plot
+```
+
+##counts
+
+```{r}
+bartlett.test(maizesamp$logITS1CopyNumber ~ maize.cond)
+hist(maizesamp$logITS1CopyNumber)
+
+# ANOVA
+CN.fungi.aov <- aov(maizesamp$logITS1CopyNumber ~ maize.cond)
+# Summary of the analysis
+summary(CN.fungi.aov)
+summary(glht(CN.fungi.aov, 
+             linfct = mcp(maize.cond = "Tukey")))
+
+fungi.maize.CN.tukey <- TukeyHSD(CN.fungi.aov)
+
+mcl <- multcompLetters4(CN.fungi.aov, fungi.maize.CN.tukey)$maize.cond$Letters
+
+plotlabels <- data.frame(x = c("Maize", "Pea", "Soybean", "Sunflower"), 
+                         y = unlist(lapply(split(maizesamp$logITS1CopyNumber, maizesamp$cond_spp), FUN = max)), 
+                         labels = c(mcl[3],mcl[4],mcl[2], mcl[1]))
+
+CN.maize.fungi <- ggplot(maizesamp, 
+                         aes(x = cond_spp, 
+                             y = logITS1CopyNumber))+
+  geom_boxplot(aes(x = cond_spp, 
+                   y = logITS1CopyNumber))+
+  geom_point(aes(alpha = 0.7))+
+  geom_text(data = plotlabels, 
+            aes(x = x, 
+                y = y, 
+                label = labels), 
+            nudge_y = 0.2)+
+  labs(x = "Preceding species", 
+       y = expression(paste("ITS gene copies (", g^-1, "wet root mass)")), 
+       tag = "F")+
+  theme_bw()+
+  theme(axis.text = element_text(size = 10, color = "black"), 
+        axis.title = element_text(size = 10),
+        legend.position = "none")+
+  annotate('text', "Sunflower", 7.15,
+           label="ANOVA~italic(p)==0.001", 
+           parse=TRUE, hjust = 0.7, size=3)
+
+CN.maize.fungi
+```
+
+
+##beta diversity
+
+Does preceding crop alter maize rhizosphere community composition?
+  
+```{r}
+# permanova/rda to test difference between groups
+# CLR transform community data.
+fungi.maize.betadisper <- betadisper(d = vegdist(fungi.maize.qpcr), 
+                                     group = maizesamp$cond_spp, 
+                                     sqrt.dist = T)
+
+anova(fungi.maize.betadisper)
+
+# test
+fungi.maize.permanova <- adonis2(fungi.maize.qpcr~cond_spp, 
+                                 data = maizesamp, 
+                                 method = "bray", 
+                                 by = "terms")
+
+fungi.maize.pairedanova <- pairwise.adonis2(fungi.maize.qpcr~cond_spp, 
+                                            data = maizesamp, 
+                                            method = "bray")
+fungi.maize.permanova
+fungi.maize.pairedanova 
+
+lapply(fungi.maize.pairedanova, FUN = kable)
+```
+
+# AMF
+expect the AMF community to be different among the treatments,
+especially soybean vs maize. -in the field study, the AMF communities were different among the rotations at the seedling stage, but not between soy
+vs. other preceding crops or at flowering. (not surprising)
+
+Also get the rhizophagus OTUs
+
+```{r}
+# get AMF community subset. Test for differences among treatments. Do differential abundance?
+maize.amf <- fungi.maize.qpcr[ ,colnames(fungi.maize.qpcr) %in% fungi.tax$otu_id[str_detect(string = fungi.tax$phylum, pattern = "Glomeromycota")]]
+
+maize.amf <- floor(maize.amf)
+
+adonis2(maize.amf~cond_spp, data = maizesamp)
+pairwise.adonis(maize.amf, as.factor(maizesamp$cond_spp))
+```
+
+community pairs that are significantly different:
+  ***sunflower - soybean***
+  **sunflower - pea**
+  ***maize - soybean***
+  **maize - pea**
+  ***soybean - pea***
+  
+  sunflower-soybean are only marginally different.
+
+Pea vs. sunflower and Pea vs. soybean were the largest differences.
+
+#ITS soybean
+
+subset soybean data
+
+```{r}
+fungi.soybean.comm <- fungi[samples$resp_spp=="Soybean", 
+                            colSums(fungi[samples$resp_spp=="Soybean", ])>0]
+
+fungi.soybean.qpcr <- fungi.qpcr[samples$resp_spp=="Soybean", 
+                                 colSums(fungi.qpcr[samples$resp_spp=="Soybean", ])>0]
+
+```
+
+##calc. diversity
+
+```{r}
+fungi.soybean.qpcr.rar <- rrarefy(floor(fungi.soybean.qpcr/1000), sample = min(rowSums(floor(fungi.soybean.qpcr/1000))))
+
+#need to calculate diversity at each level
+fungi.soybean.div.table <- data.frame(cond_spp=factor(soybeansamp$cond_spp), 
+                                      q0=hill_taxa(fungi.soybean.qpcr.rar, q=0), 
+                                      q1=hill_taxa(fungi.soybean.qpcr.rar, q=1),
+                                      q2=hill_taxa(fungi.soybean.qpcr.rar, q=2))
+
+```
+
+
+Calculate diversity for each sample to test the effect of diversity on
+seedling biomass and spad.
+
+
+##diversity
+
+```{r}
+
+bartlett.test(fungi.soybean.div.table$q1 ~ soybean.cond)
+hist(fungi.soybean.div.table$q1)
+
+# ANOVA
+fungi.soybean.diversity.aov <- kruskal.test(fungi.soybean.div.table$q1 ~ soybean.cond)
+# Summary of the analysis
+summary(fungi.soybean.diversity.aov)
+#summary(glht(fungi.soybean.diversity.aov, linfct = mcp(soysub = "Tukey")))
+
+#fungi.soybean.diversity.tukey <- TukeyHSD(fungi.soybean.diversity.aov)
+
+#mcl <- multcompLetters4(fungi.soybean.diversity.aov, fungi.soybean.diversity.tukey)$soysub$Letters
+
+#plotlabels <- data.frame(x = c("Maize", "Soybean", "Spring Wheat"), y = unlist(lapply(split(fungi.soybean.div.table$q1[-2], soybeansamp$cond_spp[-2]), FUN = max)), labels = c(mcl[1],mcl[2], mcl[3]))
+
+
+fungi.soybean.diversity.plot <- ggplot(fungi.soybean.div.table, aes(x = cond_spp, y = q1))+
+  geom_boxplot()+
+  geom_point(aes(alpha = 0.7))+
+  #geom_text(data = plotlabels, aes(x = x, y = y, label = labels), nudge_y = 8)+
+  labs(x = "Preceding species", 
+       y = expression(paste("Fungal diversity (Hill's ", italic(q), " = 1)")), 
+       tag = "D")+
+  theme_bw()+
+  theme(axis.text = element_text(size = 10, color = "black"), 
+        axis.title = element_text(size = 10),
+        legend.position = "none")+
+  annotate('text', "Spring Wheat", 15,
+           label="Kruskal-Wallis~italic(p)==0.09", 
+           parse=TRUE, hjust = 0.65, size=3)
+
+
+fungi.soybean.diversity.plot
+```
+
+##counts
+
+```{r}
+bartlett.test(soybeansamp$logITS1CopyNumber ~ soybean.cond)
+hist(soybeansamp$logITS1CopyNumber)
+
+# ANOVA
+CN.fungi.soy.aov <- kruskal.test(formula = soybeansamp$logITS1CopyNumber ~ soybean.cond)
+# Summary of the analysis
+CN.fungi.soy.aov
+#summary(glht(CN.fungi.soy.aov, 
+#            linfct = mcp(soy.sub = "Tukey")))
+
+
+#fungi.soybean.diversity.tukey <- TukeyHSD(fungi.soybean.diversity.aov)
+
+#mcl <- multcompLetters4(fungi.soybean.diversity.aov, fungi.soybean.diversity.tukey)$soysub$Letters
+
+#plotlabels <- data.frame(x = c("Maize", "Soybean", "Spring Wheat"), y = unlist(lapply(split(fungi.soybean.div.table$q1[-2], soybeansamp$cond_spp[-2]), FUN = max)), labels = c(mcl[1],mcl[2], mcl[3]))
+
+
+CN.soy.fungi <- ggplot(soybeansamp, 
+                       aes(x = cond_spp, 
+                           y = logITS1CopyNumber))+
+  geom_boxplot(aes(x = cond_spp, 
+                   y = logITS1CopyNumber))+
+  geom_point(aes(alpha = 0.7))+
+  #geom_text(data = plotlabels, aes(x = x, y = y, label = labels), nudge_y = 8)+
+  labs(x = "Preceding species", 
+       y = expression(paste("ITS gene copies (", g^-1, "wet root mass)")), 
+       tag = "F")+
+  theme_bw()+
+ theme(axis.text = element_text(size = 10, color = "black"), 
+        axis.title = element_text(size = 10),
+        legend.position = "none")+
+  annotate('text', "Spring Wheat", 6.9,
+           label="Kruskal-Wallis~italic(p)==0.13", 
+           parse=TRUE, hjust = 0.65, size=3)
+
+CN.soy.fungi
+```
+
+##beta diversity
+
+Does preceding crop alter soybean rhizosphere community composition?
+  
+```{r}
+fungi.soybean.betadisper <- betadisper(d = vegdist(fungi.soybean.qpcr), 
+                                       group = soybeansamp$cond_spp, 
+                                       sqrt.dist = T)
+
+anova(fungi.soybean.betadisper)
+
+
+# test
+fungi.soybean.permanova <- adonis2(fungi.soybean.qpcr~cond_spp, 
+                                   data = soybeansamp, 
+                                   method = "bray", 
+                                   by = "terms")
+fungi.soybean.pairedanova <- pairwise.adonis2(fungi.soybean.qpcr~cond_spp, 
+                                              data = soybeansamp, 
+                                              method = "bray")
+fungi.soybean.permanova
+fungi.soybean.pairedanova 
+
+lapply(fungi.soybean.pairedanova, FUN = kable)
+```
+
+
+#Network Analysis
+##subsets for network analysis
+use sequencing counts, spieceasi is compositionally aware
+subset bacteria and fungi to taxa in at least 10% of samples
+cbind
+remove taxa that cmultRep removes
+
+```{r}
+#all treatments - see above for filtering parameters
+# uses function from the top 
+bac.maize <- make_subsets(bac.maize.comm, 
+                          minsamp =  4)
+
+bac.maize.100 <- bac.maize[,colnames(bac.maize) %in% names(sort(colSums(bac.maize), decreasing = T)[1:100])]
+
+fungi.maize <- make_subsets(fungi.maize.comm, 
+                            minsamp =  4)
+
+fungi.maize.100 <- fungi.maize[,colnames(fungi.maize) %in% names(sort(colSums(fungi.maize), decreasing = T)[1:100])]
+
+maize.net.df <- cbind(bac.maize.100, fungi.maize.100)
+#colnames(maize.net.df)[c(353,393,410)] # these taxa were removed with cmultRep function
+maize.net.df <- maize.net.df[,-c(353,393,410)]
+
+maize.qpcr.net <- cbind(bac.maize.qpcr[,colnames(bac.maize.qpcr) %in% colnames(bac.maize.100)], fungi.maize.qpcr[,colnames(fungi.maize.qpcr) %in% colnames(fungi.maize.100)])
+
+##### soybean ####
+#all treatments
+bac.soybean <- make_subsets(bac.soybean.comm, 
+                            minsamp =  3)
+fungi.soybean <- make_subsets(fungi.soybean.comm, 
+                              minsamp =  3)
+
+bac.soybean <- bac.soybean[ ,colnames(bac.soybean) %in% names(sort(colSums(bac.soybean), decreasing = T)[1:100])]
+
+fungi.soybean <- fungi.soybean[ ,colnames(fungi.soybean) %in% names(sort(colSums(fungi.soybean), decreasing = T)[1:100])]
+
+soy.net.df <- cbind(bac.soybean, fungi.soybean)
+soy.net.df <- soy.net.df[,-c(176,188)]
+
+soy.qpcr.net <- cbind(bac.soybean.qpcr[,colnames(bac.soybean.qpcr) %in% colnames(bac.soybean)], fungi.soybean.qpcr[,colnames(fungi.soybean.qpcr) %in% colnames(fungi.soybean)])
+
+#assign row names for matching!! this is a revised taxonomy thing. 
+row.names(fungi.tax.ref) <- fungi.tax.ref$otu_id
+#get a combined taxa df
+all.taxa <- rbind(bacteria.tax[ ,4:11], fungi.tax.ref[,3:10])
+```
+
+
+##maize
+### association matrix
+### network analysis
+```{r}
+# sparsMethod must be set to "none" because sparsification is already included in SpiecEasi
+
+net_maize <- netConstruct(data = maize.net.df, 
+                          dataType = "count", 
+                          measure = "spieceasi",
+                          sparsMethod = "none")
+
+# calculations: Association matrix is from spieceasi
+# see spieceasi documentation for details on getting association matrix from spiec-easi
+# next, association matrix is transformed into a dissimilarity matrix (lower triangle only) sqrt(0.5*(1-xvec)) (same as in wgcna)
+
+# then, the dissimilarity matrix is transformed into a similarity matrix.
+# the similarity matrix is the same as the adjacency matrix if the association matrix is weighted (true for spieceasi)
+
+# analyze the network - does everything, including modules.
+net_maize_analyze <- netAnalyze(net_maize, 
+                                hubPar = c("eigenvector", "degree", "betweeness"),
+                                clustMethod = "cluster_fast_greedy", )
+summary(net_maize_analyze) # 
+maize.hubs <- net_maize_analyze$hubs$hubs1
+all.taxa[match(maize.hubs , row.names(all.taxa)), ]
+
+maize.node.labels <- all.taxa$taxa_labels[match(colnames(maize.net.df), row.names(all.taxa))]
+names(maize.node.labels) <- colnames(maize.net.df)
+# 
+# cexLabels = 0.5,
+#      labels = maize.node.labels,
+#      rmSingles = TRUE, highlightHubs=T, labelScale = F
+
+plot(net_maize_analyze, 
+     layout = "spring",
+     nodeColor = "cluster",
+     nodeSize = "mclr",
+     #edgeFilter = "threshold", 
+     #edgeFilterPar = 0.05,
+     title1 = "Maize Network with MB assn matrix", 
+     showTitle = TRUE,
+     cexTitle = 2.3,
+     cexLabels = 0.5,
+     labels = maize.node.labels,
+     rmSingles = TRUE, highlightHubs=T, labelScale = F)
+```
+
+
+### get modules and correlations between modules and treatment groups
+```{r}
+#pull out assigned modules
+maize.modules <- net_maize_analyze$clustering$clust1
+#make sure the order is the same
+summary(names(maize.modules) == colnames(maize.net.df))
+# subset taxa to modules taxa
+moduletaxa <- all.taxa[row.names(all.taxa) %in% names(maize.modules), ]
+#check matches
+summary(names(maize.modules) == row.names(moduletaxa))
+#combine dfs
+maize.modules <- data.frame(maize.modules, moduletaxa)
+
+# get "Trait" data.
+moduletraitdata <- sapply(maizesamp[ ,c(23,45:48)], FUN =  as.numeric) 
+#make row names match
+row.names(moduletraitdata) <- maizesamp$idmatch
+
+#Define number of genes and samples
+nMicrobes = ncol(maize.net.df)
+nSamples = nrow(maizesamp)
+
+#define color modules - don't actually need to use colors - the number vector works fine
+length(unique(maize.modules$maize.modules)) # 18 modules
+
+#Calculate MEs with color labels from modules
+#replace zeros
+maize.net.df.zrep <- cmultRepl(maize.net.df)
+#get clr transformed data
+maize.both.clr <- decostand(maize.net.df.zrep, method = "clr")
+#get module eigengenes
+MEs0 <-  moduleEigengenes(maize.both.clr, maize.modules$maize.modules)$eigengenes
+# reorder eigenvectors to put similar ones next to each other.
+MEs <-  orderMEs(MEs0)
+
+# get correlation between module eigengenes and trait data
+moduleTraitCor <-  cor(MEs, moduletraitdata, use = 'p', method = 'spearman')
+# get correlation p value
+moduleTraitPvalue <-  corPvalueStudent(moduleTraitCor, nSamples)
+# adjust p value
+moduleTraitPvalue <- p.adjust(moduleTraitPvalue, method = "BH")
+
+# remove taxa that didn't fit in a module
+maize.modules <- maize.modules[maize.modules$maize.modules != 0, ]
+
+#write.csv(maize.modules, "Maize module assignments 200 taxa.csv")
+```
+
+### plot modules
+```{r}
+# prepare plot
+
+# little function to assign stars instead of numbers
+makeStars <- function(x){
+  stars <- c("****", "***", "**", "*", ".", "")
+  vec <- c(0, 0.0001, 0.001, 0.01, 0.05, 0.1 ,1)
+  i <- findInterval(x, vec)
+  stars[i]
+}
+
+# textMatrix <-  paste(signif(moduleTraitCor, 2), "\n(",
+#                         signif(moduleTraitPvalue, 1), ")", 
+#                   sep= "")
+
+# make a matrix of p-values
+textMatrix <-  paste0(signif(moduleTraitCor, 2), "\n", sapply(moduleTraitPvalue, FUN = function(x) makeStars(x)))
+# get dimensions right
+dim(textMatrix) = dim(moduleTraitCor)
+#assign col and row names
+colnames(textMatrix) <- colnames(moduleTraitCor)
+row.names(textMatrix) <- row.names(moduleTraitCor)
+# create color scheme
+colorfunction <- colorRampPalette(RColorBrewer::brewer.pal(11, "RdBu"), interpolate = "linear")
+
+# plot the module - trait correlations
+labeledHeatmap(Matrix = moduleTraitCor,
+               xLabels = c("Shoot Biomass", "Pea","Sunflower", "Soybean", "Maize"),
+               yLabels = substring(names(MEs), 3),
+               ySymbols = names(MEs),
+               colorLabels = FALSE,
+               colors = colorfunction(50),
+               textMatrix = textMatrix,
+               setStdMargins = T,
+               cex.text = 0.5,
+               zlim = c(-1,1),
+               main = paste("Module-Treatment Relationships"))
+
+
+
+dim(moduleTraitPvalue)=dim(moduleTraitCor)
+row.names(moduleTraitPvalue) <- row.names(moduleTraitCor)
+moduleTraitPvalue<0.02
+
+# Not significant: 
+# 15, 1, 4, 7, 12
+# moderately
+# 16, 
+
+
+# correlation matrix and labels to long format
+plotModuleTraitCor <- moduleTraitCor %>% cor_gather()
+plotModuleTraitLabels <- textMatrix %>% cor_gather()
+
+# get module numbers
+plotModuleTraitCor$ylabs <- str_sub(plotModuleTraitCor$var1, 3)
+
+# add labels
+plotModuleTraitCor$cor_labels <- plotModuleTraitLabels$cor
+
+#write.csv(plotModuleTraitCor)
+#subset to just modules with significant correlation
+plotModuleTraitCor <- plotModuleTraitCor[!plotModuleTraitCor$ylabs %in% c(0,15,1,4,7,12,16),]
+
+unique(plotModuleTraitCor$ylabs)
+# change the labels to get the correct order on the plots
+#plotModuleTraitCor$ylabs <- factor(plotModuleTraitCor$ylabs, levels = rev(c("2", "5", "6", "1",  "3", "7", "4", "8")))
+#plotModuleTraitLabels$ylabs <- factor(plotModuleTraitLabels$ylabs, levels = rev(c("2", "5", "6", "1",  "3", "7", "4", "8")))
+
+plotModuleTraitCor$ylabs <- factor(plotModuleTraitCor$ylabs, levels = rev(c("6", "3", "9", "18", "13", "11", "14", "5", "8", "2", "17", "10")))
+
+# reorder the traits
+plotModuleTraitCor$ordered_treatment <- factor(plotModuleTraitCor$var2, levels = c("response.dry.mass.g", "maize.pea", "maize.sunflower", "maize.maize", "maize.soybean"))
+
+
+# make ggplot version. try cowplots
+
+maize.module.plot <- ggplot()+
+  
+  geom_tile(aes(x = plotModuleTraitCor$ordered_treatment, 
+                y = plotModuleTraitCor$ylabs, 
+                fill = plotModuleTraitCor$cor))+
+  
+  geom_text(aes(x = plotModuleTraitCor$ordered_treatment, 
+                y = plotModuleTraitCor$ylabs, 
+                label = plotModuleTraitCor$cor_labels), size = 3)+
+  
+  scale_fill_distiller(palette = "PRGn", direction = 1)+
+  
+  labs(x = "Maize Biomass and Treatments" , 
+       y = "Module Eigengene",
+       fill = "Spearman\nCorrelation",tag = "A")+
+  
+  scale_x_discrete(labels = c("Shoot\nBiomass", "Pea", "Sunflower","Maize", "Soybean")) +
+  theme_minimal()+
+  theme(axis.text.x.bottom = element_text(angle = 45, 
+                                          size = 10, hjust = 0.7, color = "black"),
+        axis.text.y = element_text(color = "black"),
+        axis.title = element_text(size = 10, color = "black"), 
+        legend.position = "right", 
+        panel.grid = element_blank(),
+        legend.key.size = unit(12,"pt"), 
+        legend.text = element_text(size = 9), 
+        legend.title = element_text(size = 10))
+
+
+maize.module.plot
+```
+
+### taxa plot
+collect information about each module. What taxa are significant?
+  
+```{r}
+maize.modules <- maize.modules[!maize.modules$maize.modules %in% c(0,15,1,4,7,12,16),]
+maize.modules$mod.ordered <- factor(maize.modules$maize.modules, levels =  rev(c("6", "3", "9", "18", "13", "11", "14", "5", "8", "2", "17", "10")))
+
+maize.modules$phy.clean <- gsub("_.*", "", maize.modules$phylum)
+maize.modules$phy.clean[maize.modules$phy.clean == ""] <- "unidentified fungi"
+unique(maize.modules$phy.clean) # 12, six of each
+# need to get different colors, alphabetical
+# bac, bac, fungi, bac, fungi, fungi, fungi, bac, bac, fungi, fungi, bac
+
+pale <- color("pale")
+medcon <- color("medium contrast")
+mod.phy.cols <- c(pale(6), medcon(6))
+#mod.phy.cols[12] <- "#777777"
+#mod.phy.cols <- nightfall(12)[1:12]
+#mod.phy.cols <- c("#D9CCE3", "#BA8DB4", "#4EB265", "#882E72", "#CAE0AB", "#F4A736", "#EE8026", "#1965B0", "#6195CF",  "#E65518", "#777777", "#7BAFDE")
+
+
+maize.modules$phy.sorted <- factor(maize.modules$phy.clean, levels = c("Acidobacteriota", "Actinobacteriota", "Bacteroidota", "Patescibacteria","Proteobacteria", "Verrucomicrobiota","Ascomycota","Basidiomycota","Glomeromycota","Mortierellomycota","Rozellomycota", "unidentified fungi"))
+
+
+maize.module.taxa.plot <- ggplot(maize.modules, aes(y=mod.ordered))+
+  geom_bar(aes(fill = phy.sorted), stat = "count", position = "stack")+
+  facet_grid(cols = vars(kingdom), scales = "free")+
+  labs(x = "Number of ASVs/OTUs per Module", 
+       y = NULL, 
+       fill = "Phylum", tag = "B")+
+  scale_fill_manual(values = mod.phy.cols)+
+  theme_minimal()+
+  xlim(0,13)+
+theme(axis.title.x = element_text(size = 10, color = "black"), 
+      axis.text = element_text(color = "black"),
+      legend.key.size = unit(12,"pt"), 
+      legend.text = element_text(size = 9), 
+      legend.title = element_text(size = 10), panel.grid.minor = element_blank())
+maize.module.taxa.plot
+
+
+fig3 <- maize.module.plot+maize.module.taxa.plot+plot_layout(guides = "collect")
+fig3
+#tiff(filename="figure3.tiff", res=300, width = 7, height = 7, units = "in")
+#plot(soybean.module.plot+soybean.module.taxa.plot+plot_layout(guides = "collect"))
+#dev.off()
+
+```
+
+
+###explore modules
+eigengene = pc1
+PC1 also summarizes taxa that are positively or negatively correlated with other taxa in the module.
+
+-check to see what guilds comprise each module
+
+Focus on modules 3 and 17 - 17 is negatively correlated with pea treatments and shoot biomass, while 3 is positively correlated with pea treatments and biomass
+```{r}
+# mod 3
+mod3 <- maize.both.clr[, colnames(maize.both.clr) %in% row.names(maize.modules)[maize.modules$maize.modules == 3]]
+
+mod3pc <- prcomp(mod3, scale = T) # scaling doesn't really change much because its already transformed by clr.
+plot(mod3pc)
+summary(mod3pc)
+# rotation returns the loadings
+mod3.pc1 <- sort(mod3pc$rotation[,1]) 
+#subset and match
+mod3.fungi <- mod3.pc1[str_detect(names(mod3.pc1), "OTU")]
+
+guild.maize.3<- fungi.tax.ref[fungi.tax.ref$otu_id %in% names(mod3.fungi),]
+guild.maize.3 <- guild.maize.3[match(names(mod3.fungi), guild.maize.3$otu_id), ]
+
+mod3.fungi <- data.frame(pc1=mod3.fungi, 
+                         guild.maize.3)
+mod3.fungi$module <- 3
+
+
+mod3nmds <- metaMDS(mod3, distance = "euclid", k = 3)
+mod3nmds.scrs <- scores(mod3nmds, display = "sites")
+ggplot(mod3nmds.scrs, aes(NMDS1, NMDS2))+
+  geom_point(aes(color = maizesamp$cond_spp))
+
+maizeedgelist <- net_maize$edgelist1
+
+# associations for taxa in each module
+mod3asso <- maizeedgelist[maizeedgelist$v1 %in% colnames(mod3) & maizeedgelist$v2 %in% colnames(mod3),]
+mod3asso <- mod3asso[,1:3]
+mod3asso <- mod3asso[order(mod3asso$asso),]
+
+mod3asso$taxa1 <- all.taxa$taxa_labels[match(mod3asso$v1, row.names(all.taxa))]
+mod3asso$taxa2 <- all.taxa$taxa_labels[match(mod3asso$v2, row.names(all.taxa))]
+#write.csv(mod3asso, "maize module 3 taxa association.csv", quote = F)
+
+
+
+# mod 17
+mod17 <- maize.both.clr[, colnames(maize.both.clr) %in% row.names(maize.modules)[maize.modules$maize.modules == 17]]
+
+mod17pc <- prcomp(mod17, scale = T) # scaling doesn't really change much because its already transformed by clr.
+plot(mod17pc)
+summary(mod17pc)
+# rotation returns the loadings
+mod17.pc1 <- sort(mod17pc$rotation[,1]) 
+#subset and match
+mod17.fungi <- mod17.pc1[str_detect(names(mod17.pc1), "OTU")]
+
+guild.maize.17<- fungi.tax.ref[fungi.tax.ref$otu_id %in% names(mod17.fungi),]
+guild.maize.17 <- guild.maize.17[match(names(mod17.fungi), guild.maize.17$otu_id), ]
+
+mod17.fungi <- data.frame(pc1=mod17.fungi, 
+                          guild.maize.17)
+mod17.fungi$module <- 17
+
+
+mod17asso <- maizeedgelist[maizeedgelist$v1 %in% colnames(mod17) & maizeedgelist$v2 %in% colnames(mod17),]
+mod17asso <- mod17asso[,1:3]
+mod17asso <- mod17asso[order(mod17asso$asso),]
+
+mod17asso$taxa1 <- all.taxa$taxa_labels[match(mod17asso$v1, row.names(all.taxa))]
+mod17asso$taxa2 <- all.taxa$taxa_labels[match(mod17asso$v2, row.names(all.taxa))]
+#write.csv(mod17asso, "maize module 17 taxa association.csv", quote = F)
+
+# checking abundance in samples
+# OTU_66 = Rhizophagus irregularis
+ggplot()+
+  geom_point(aes(x = samples$cond_spp, y = fungi$`OTU_29`, shape = samples$resp_spp))
+```
+
+modules are thought to represent functional groups or possible taxa interactions, but this is still not really tested. 
+
+Hubs are thought to be "keystone" taxa - only detected 3 hub taxa - all bacteria
+
+- most modules have positively and negatively correlated taxa
+
+the absence of AMF from the pea treatments was notable. differential abundance (not aldex - another method) also found AMF to be less abundant in pea treatments.
+
+get significant taxa: taxa that are correlated with treatment groups
+taxa module membership
+```{r}
+# Get correlation between taxa normalized abundance and trait
+# Get correlation between taxa normalized abundance and trait values
+# can use these correlations and filter to module.
+biomass.Correlation <-  as.data.frame(cor(log(maize.qpcr.net, base = 10), maizesamp$response.dry.mass.g, use = "p", method = "spearman"))
+biomass.Pvalue <-  as.data.frame(corPvalueStudent(as.matrix(biomass.Correlation), 
+                                                  nSamples))
+
+pea.Correlation <-  as.data.frame(cor(log(maize.qpcr.net, base = 10), as.numeric(maizesamp$maize.pea), use = "p", method = "spearman"))
+pea.Pvalue <-  as.matrix(corPvalueStudent(as.matrix(pea.Correlation), 
+                                          nSamples))
+pea.Pvalue <- p.adjust(pea.Pvalue[,1], method = "BH")
+
+soybean.Correlation <-  as.data.frame(cor(log(maize.qpcr.net, base = 10), as.numeric(maizesamp$maize.soybean), use = "p", method = "spearman"))
+soybean.Pvalue <-  as.matrix(corPvalueStudent(as.matrix(soybean.Correlation), 
+                                              nSamples))
+soybean.Pvalue <- p.adjust(soybean.Pvalue[,1], method = "BH")
+
+maize.Correlation <-  as.data.frame(cor(log(maize.qpcr.net, base = 10), as.numeric(maizesamp$maize.maize), use = "p", method = "spearman"))
+maize.Pvalue <-  as.matrix(corPvalueStudent(as.matrix(maize.Correlation), 
+                                            nSamples))
+maize.Pvalue <- p.adjust(maize.Pvalue[,1], method = "BH")
+
+sunflower.Correlation <-  as.data.frame(cor(log(maize.qpcr.net, base = 10), as.numeric(maizesamp$maize.sunflower), use = "p", method = "spearman"))
+sunflower.Pvalue <-  as.matrix((corPvalueStudent(as.matrix(sunflower.Correlation), nSamples)))
+sunflower.Pvalue <- p.adjust(sunflower.Pvalue[,1], method = "BH")
+
+maize.taxa.trait.corr <- data.frame(biomass.Correlation,
+                                    biomass.Pvalue,
+                                    soybean.Correlation, 
+                                    soybean.Pvalue,
+                                    pea.Correlation,
+                                    pea.Pvalue,
+                                    maize.Correlation,
+                                    maize.Pvalue,
+                                    sunflower.Correlation,
+                                    sunflower.Pvalue)
+
+colnames(maize.taxa.trait.corr) <- c("biomass.Correlation",
+                                     "biomass.Pvalue",
+                                     "soybean.Correlation", 
+                                     "soybean.Pvalue", 
+                                     "pea.Correlation",
+                                     "pea.Pvalue",
+                                     "maize.Correlation",
+                                     "maize.Pvalue",
+                                     "sunflower.Correlation",
+                                     "sunflower.Pvalue")
+
+
+taxasubsetmaize <- all.taxa[row.names(all.taxa) %in% row.names(maize.taxa.trait.corr), ]
+
+#add taxonomy to trait-asv/otu correlations
+maize.taxa.trait.corr <- cbind(maize.taxa.trait.corr, taxasubsetmaize[match(row.names(maize.taxa.trait.corr), row.names(taxasubsetmaize)), ])
+
+# get a the subset of the taxa and correlations
+maize.module.summary <- maize.taxa.trait.corr[row.names(maize.taxa.trait.corr) %in% row.names(maize.modules), ]
+
+maize.module.summary <- maize.module.summary[match(row.names(maize.modules), row.names(maize.module.summary)), ]
+
+# add module info
+maize.module.summary <- cbind(modules=maize.modules[,1], maize.module.summary)
+
+#write.csv(maize.module.summary, "maize_module_summary_200.csv", quote = F)
+
+
+maize.taxa.trait.sig <- maize.module.summary[maize.module.summary$biomass.Pvalue<0.05 |
+                                               maize.module.summary$soybean.Pvalue<0.05 |
+                                               maize.module.summary$pea.Pvalue<0.05 |
+                                               maize.module.summary$maize.Pvalue<0.05 |
+                                               maize.module.summary$sunflower.Pvalue<0.05, ]
+
+
+maize.taxa.trait.sig <- maize.taxa.trait.sig[abs(maize.taxa.trait.sig$biomass.Correlation)>0.7 |                                      abs(maize.taxa.trait.sig$soybean.Correlation)>0.7|
+                                               abs(maize.taxa.trait.sig$pea.Correlation)>0.7|                                      abs(maize.taxa.trait.sig$maize.Correlation)>0.7|                                      abs(maize.taxa.trait.sig$sunflower.Correlation)>0.7, ]
+
+#write.csv(maize.taxa.trait.sig, "maize_taxa_trait_sig_200.csv", quote = F)
+```
+
+
+
+#AMF taxa in the pea-maize treatment vs. other treatments
+```{r}
+# want to look at OTUs: 60, 67, 66, 5664
+# get abundance of fungi in modules 3 and 17
+fungi.mods <- fungi.maize.qpcr[ ,colnames(fungi.maize.qpcr) %in% c(rownames(mod3.fungi),colnames(mod17))]
+
+# check taxonomy
+fungi.tax.ref[fungi.tax.ref$otu_id %in% colnames(fungi.mods),]
+
+# check abundance visually
+ggplot()+
+  #geom_boxplot(aes(x = maizesamp$cond_spp, y = fungi.mods$OTU_29))+
+  geom_point(aes(x = maizesamp$cond_spp, y = log(fungi.mods$OTU_60, base = 10)))
+
+# get mean and sd for each treatment and OTU - 60, 67, 66
+aggregate(fungi.mods$OTU_66~maizesamp$cond_spp,FUN = mean)
+aggregate(fungi.mods$OTU_66~maizesamp$cond_spp,FUN = sd)
+
+summary(colnames(fungi.qpcr) == fungi.tax.ref$otu_id)
+maize.amf <- fungi.qpcr[, colnames(fungi.qpcr) %in% c("OTU_60", "OTU_66", "OTU_67", "OTU_5664")]
+#maize.amf <- fungi.qpcr[ ,fungi.tax.ref$species == "Rhizophagus_irregularis"]
+maize.amf <- maize.amf[samples$resp_spp  == "Maize", ]
+maize.amf <- maize.amf[,colSums(maize.amf)>0] # 398 AMF OTUs
+
+maize.amf.log <- sapply(maize.amf, FUN = log10)
+maize.amf.log[!is.finite(maize.amf.log)] <- 0
+maize.amf.log <- as.data.frame(maize.amf.log)
+rownames(maize.amf.log) <- row.names(maizesamp)
+# test with anova. just want to know if AMF overall are more or less abundant in the pea treatment vs. other treatments.
+# summarize total AMF abundance: log(rowSums)
+# test row sums vector with aov
+maize.amf.log$maize.cond <- maize.cond
+
+#AMF abundance and log abundance mean and sd
+amfabundtab <- maize.amf.log %>% 
+    group_by(maize.cond) %>% # our group
+    summarise( # summarise operation by group
+        OTU66_mean = mean(OTU_66),
+        OTU66_std = sd(OTU_66), 
+        OTU60_mean = mean(OTU_60), 
+        OTU60_std = sd(OTU_60),
+        OTU67_mean = mean(OTU_67), 
+        OTU67_std = sd(OTU_67),
+        OTU5664_mean = mean(OTU_5664), 
+        OTU5664_std = sd(OTU_5664)
+    )
+
+fungimods.samp
+amfabundtab <- fungimods.samp %>% 
+    group_by(cond_spp) %>% # our group
+    summarise( # summarise operation by group
+        OTU66_mean = mean(OTU_66),
+        OTU66_std = sd(OTU_66), 
+        OTU60_mean = mean(OTU_60), 
+        OTU60_std = sd(OTU_60),
+        OTU67_mean = mean(OTU_67), 
+        OTU67_std = sd(OTU_67),
+        OTU5664_mean = mean(OTU_5664), 
+        OTU5664_std = sd(OTU_5664)
+    )
+
+#write.csv(amfabundtab, "Maize module AMF abundance.csv")
+```
+
+check the four OTUs abundance in each treatment
+```{r}
+# test with anova. just want to know if AMF overall are more or less abundant in the pea treatment vs. other treatments.
+# summarize total AMF abundance: log(rowSums)
+# test row sums vector with aov
+bartlett.test(maize.amf.log$OTU_66 ~ maize.cond)# use KW
+hist(maize.amf.log$OTU_66)
+otu66test <- kruskal.test(maize.amf.log$OTU_66, maize.cond)
+otu66test
+dunn_test(formula = OTU_66 ~ maize.cond, data = maize.amf.log, p.adjust.method = "bonferroni") 
+
+bartlett.test(maize.amf.log$OTU_60 ~ maize.cond)# use KW
+hist(maize.amf.log$OTU_60)
+otu60test <- kruskal.test(maize.amf.log$OTU_60, maize.cond)
+otu60test
+dunn_test(formula = OTU_60 ~ maize.cond, data = maize.amf.log, p.adjust.method = "bonferroni") 
+
+
+bartlett.test(maize.amf.log$OTU_67 ~ maize.cond)# use KW
+hist(maize.amf.log$OTU_67)
+otu67test <- kruskal.test(maize.amf.log$OTU_67, maize.cond)
+otu67test
+dunn_test(formula = OTU_67 ~ maize.cond, data = maize.amf.log, p.adjust.method = "bonferroni") 
+
+
+bartlett.test(maize.amf.log$OTU_5664 ~ maize.cond)# use KW
+hist(maize.amf.log$OTU_5664)
+otu5664test <- kruskal.test(maize.amf.log$OTU_5664, maize.cond)
+otu5664test
+dunn_test(formula = OTU_5664 ~ maize.cond, data = maize.amf.log, p.adjust.method = "bonferroni") 
+```
+
+#soybean
+###construct network
+###analyze network
+```{r}
+net_soybean <- netConstruct(data = soy.net.df, 
+                            dataType = "count",
+                            measure = "spieceasi",
+                            sparsMethod = "none")
+
+net_soybean_analyze <- netAnalyze(net_soybean, 
+                                  hubPar = c("eigenvector", "degree"),
+                                  clustMethod = "cluster_fast_greedy")
+
+
+
+summary(net_soybean_analyze)
+net_soybean_analyze$hubs
+
+soybean.node.labels <- all.taxa$taxa_labels[match(colnames(soy.net.df), row.names(all.taxa))]
+names(soybean.node.labels) <- colnames(soy.net.df)
+
+
+plot(net_soybean_analyze, 
+     layout = "spring",
+     nodeColor = "cluster",
+     nodeSize = "eigenvector",
+     edgeFilter = "threshold", 
+     edgeFilterPar = 0.05,
+     title1 = "Soybean Network with MB assn matrix", 
+     showTitle = TRUE,
+     cexTitle = 2.3, 
+     cexLabels = 0.5,
+     labels = soybean.node.labels,
+     rmSingles = TRUE, highlightHubs=T, labelScale = F)
+```
+
+
+###get modules
+###module correlation with traits
+```{r}
+soybean.modules <- net_soybean_analyze$clustering$clust1
+summary(names(soybean.modules) == colnames(soy.net.df))
+
+# gather taxa
+all.taxa.soybean <- rbind(bacteria.tax[ ,4:11], fungi.tax.ref[,3:10])
+#subset to taxa in soybean modules
+soybeanmoduletaxa <- all.taxa.soybean[row.names(all.taxa.soybean) %in% names(soybean.modules), ]
+# check for matching names
+summary(names(soybean.modules) == row.names(soybeanmoduletaxa))
+# combine data frames
+soybean.modules <- data.frame(soybean.modules, soybeanmoduletaxa)
+
+# get "Trait" data.
+soybean.moduletraitdata <- sapply(soybeansamp[,c(23,45:47)], FUN =  as.numeric) 
+#add row names
+row.names(soybean.moduletraitdata) <- soybeansamp$idmatch
+
+#Define number of genes and samples
+snMicrobes = ncol(soy.net.df)
+snSamples = nrow(soybeansamp)
+
+#define color modules - don't actually need to use colors - the number vector works fine
+unique(soybean.modules$soybean.modules) # 13 modules - the zero doesn't count
+
+#Calculate MEs with color labels from modules
+soy.net.zrep <- cmultRepl(soy.net.df) # 227, 262, 301, 378, 379
+soybean.both.clr <- decostand(soy.net.zrep, method = "clr")
+soybean.MEs0 <-  moduleEigengenes(soybean.both.clr, soybean.modules$soybean.modules)$eigengenes
+soybean.MEs <-  orderMEs(soybean.MEs0)
+
+# get correlation between module eigengenes and trait data
+soybean.moduleTraitCor <-  cor(soybean.MEs, soybean.moduletraitdata, use = 'p', method = 'spearman')
+#get p-values
+soybean.moduleTraitPvalue <-  corPvalueStudent(soybean.moduleTraitCor, snSamples)
+# correct p-values
+soybean.moduleTraitPvalue <- p.adjust(soybean.moduleTraitPvalue, method = "BH")
+
+soybean.textMatrix <-  paste0(signif(soybean.moduleTraitCor, 2), "\n", sapply(soybean.moduleTraitPvalue, FUN = function(x) makeStars(x)))
+
+dim(soybean.textMatrix) = dim(soybean.moduleTraitCor)
+colnames(soybean.textMatrix) <- colnames(soybean.moduleTraitCor)
+row.names(soybean.textMatrix) <- row.names(soybean.moduleTraitCor)
+
+
+```
+
+###plot
+```{r}
+# make long dfs
+soybean.plotModuleTraitCor <- soybean.moduleTraitCor %>% cor_gather()
+soybean.plotModuleTraitLabels <- soybean.textMatrix %>% cor_gather()
+
+soybean.modplot <- cbind(soybean.plotModuleTraitCor, cor_label=soybean.plotModuleTraitLabels$cor)
+
+soybean.modplot$ylabs <- str_sub(soybean.modplot$var1, 3)
+
+#remove unassigned taxa and nonsignificant modules: 0,11, 10
+soybean.modplot <- soybean.modplot[!soybean.modplot$ylabs %in% c(0,11,10), ]
+
+# get the modules in order
+soybean.modplot$ylabs <- factor(soybean.modplot$ylabs, levels = rev(c("1","2","6","7","12","8","3","9","4","5","13")))
+
+#put the treatments in order
+soybean.modplot$ordered_treatment <- factor(soybean.modplot$var2, levels = c("response.dry.mass.g", "soybean.soybean", "soybean.maize", "soybean.wheat"))
+
+soybean.modplot$ordered_treatment <- factor(soybean.modplot$var2, levels = c("response.dry.mass.g", "soybean.soybean", "soybean.maize", "soybean.wheat"))
+
+
+soybean.module.plot <- ggplot(soybean.modplot)+
+  
+  geom_tile(aes(x = ordered_treatment, 
+                y = ylabs, 
+                fill = cor))+
+  
+  geom_text(aes(x = ordered_treatment, 
+                y = ylabs, 
+                label = cor_label), size = 3)+
+  
+  
+  scale_fill_distiller(palette = "PRGn", direction = 1)+
+  
+  labs(x = "Soybean Biomass and Treatments" , 
+       y = "Module Eigengene",
+       fill = "Spearman\nCorrelation",tag = "A")+
+  
+  scale_x_discrete(labels = c("Shoot\nBiomass", "Soybean", "Maize", "Spring\nWheat")) +
+  theme_minimal()+
+  theme(axis.text.x.bottom = element_text(angle = 45, 
+                                          size = 10, hjust = 0.7, color = "black"),
+        axis.text.y = element_text(color = "black"),
+        axis.title = element_text(size = 10, color = "black"), 
+        legend.position = "right", 
+        panel.grid = element_blank(),
+        legend.key.size = unit(12,"pt"), 
+        legend.text = element_text(size = 9), 
+        legend.title = element_text(size = 10))
+
+soybean.module.plot
+#write.csv(soybean.modules, "soybean_modules_200_taxa.csv", quote = F)
+```
+
+
+###taxa - module - trait correlations
+```{r}
+# what are the correlations between taxa and modules?
+# otu table correlation with module PCs. and significance.
+# this doesn't really make sense? we already defined the taxa in each module.
+soybean.modNames <-  substring(names(soybean.MEs), 3)
+soybean.taxaModuleMembership <-  as.data.frame(cor(soybean.both.clr, soybean.MEs, use = "p", method = "spearman"));
+soybean.tMMPvalue <-  as.data.frame(corPvalueStudent(as.matrix(soybean.taxaModuleMembership), snSamples))
+
+# Get correlation between taxa normalized abundance and trait values
+soybiomass.Correlation <-  as.data.frame(cor(log(soy.qpcr.net, base = 10), soybeansamp$response.dry.mass.g, use = "p", method = "spearman"))
+soybiomass.Pvalue <-  as.data.frame(corPvalueStudent(as.matrix(soybiomass.Correlation), 
+                                                     snSamples))
+soybiomass.Pvalue <- p.adjust(soybiomass.Pvalue[,1])
+
+
+soymaize.Correlation <-  as.data.frame(cor(log(soy.qpcr.net, base = 10), as.numeric(soybeansamp$soybean.maize), use = "p",  method = "spearman"))
+soymaize.Pvalue <-  as.data.frame(corPvalueStudent(as.matrix(soymaize.Correlation), snSamples))
+soymaize.Pvalue <- p.adjust(soymaize.Pvalue[,1])
+
+
+soysoybean.Correlation <-  as.data.frame(cor(log(soy.qpcr.net, base = 10), as.numeric(soybeansamp$soybean.soybean), use = "p",  method = "spearman"))
+soysoybean.Pvalue <-  as.data.frame(corPvalueStudent(as.matrix(soysoybean.Correlation), 
+                                                     snSamples))
+soysoybean.Pvalue <- p.adjust(soysoybean.Pvalue[,1])
+
+soywheat.Correlation <-  as.data.frame(cor(log(soy.qpcr.net, base = 10), as.numeric(soybeansamp$soybean.wheat), use = "p",  method = "spearman"))
+soywheat.Pvalue <-  as.data.frame(corPvalueStudent(as.matrix(soywheat.Correlation),snSamples))
+soywheat.Pvalue <- p.adjust(soywheat.Pvalue[,1])
+
+# correlation data frame
+soybean.taxa.trait.corr <- data.frame(soybiomass.Correlation,
+                                      soybiomass.Pvalue,
+                                      soysoybean.Correlation, 
+                                      soysoybean.Pvalue,
+                                      soymaize.Correlation,
+                                      soymaize.Pvalue,
+                                      soywheat.Correlation,
+                                      soywheat.Pvalue)
+
+colnames(soybean.taxa.trait.corr) <- c("biomass.Correlation",
+                                       "biomass.Pvalue",
+                                       "soybean.Correlation", 
+                                       "soybean.Pvalue", 
+                                       "maize.Correlation",
+                                       "maize.Pvalue",
+                                       "wheat.Correlation",
+                                       "wheat.Pvalue")
+
+
+soybean.module.summary <- soybean.taxa.trait.corr[row.names(soybean.taxa.trait.corr) %in% row.names(soybean.modules), ]
+
+soybean.module.summary <- soybean.module.summary[match(row.names(soybean.modules), row.names(soybean.module.summary)), ]
+
+soybean.module.summary <- cbind(modules=soybean.modules[,1], soybean.module.summary, soybean.modules[,2:8])
+
+#write.csv(soybean.module.summary,"soybean_trait_taxa_correlation_200.csv", quote = F)
+
+soybean.taxa.trait.sig <- soybean.module.summary[soybean.module.summary$biomass.Pvalue<0.05 |
+                                                   soybean.module.summary$soybean.Pvalue<0.05 |
+                                                   soybean.module.summary$maize.Pvalue<0.05 |
+                                                   soybean.module.summary$wheat.Pvalue<0.05, ]
+
+
+
+soybean.taxa.trait.sig <- soybean.taxa.trait.sig[abs(soybean.taxa.trait.sig$biomass.Correlation)>0.7 |                                      abs(soybean.taxa.trait.sig$soybean.Correlation)>0.7|                                  abs(soybean.taxa.trait.sig$maize.Correlation)>0.7|                                        abs(soybean.taxa.trait.sig$wheat.Correlation)>0.7, ]
+#write.csv(soybean.taxa.trait.sig, "soybean.tax.trait.sig.200.csv", quote= F)
+```
+
+###plot module composition
+```{r}
+soybean.modules.sub <- soybean.modules[!soybean.modules$soybean.modules %in% c(0,10,11), ]
+soybean.modules.sub$mod.ordered <- factor(soybean.modules.sub$soybean.modules, levels =  rev(c("1","2","6","7","12","8","3","9","4","5","13")))
+
+soybean.modules.sub$phy.clean <- gsub("_.*", "", soybean.modules.sub$phylum)
+soybean.modules.sub$phy.clean[soybean.modules.sub$phy.clean == ""] <- "unidentified fungi"
+unique(soybean.modules.sub$phy.clean)
+# 16 taxa, 10 bacteria, 6 fungi
+soy.mod.phy.cols <- c(RColorBrewer::brewer.pal(n = 10,name = "Set3"), medcon(6))
+
+soybean.modules.sub$phy.clean[soybean.modules.sub$phy.clean == "Firmicutes"] <- "Bacillota"
+
+soybean.modules.sub$phy.sorted <- factor(soybean.modules.sub$phy.clean, levels = c("Acidobacteriota", "Actinobacteriota", "Bacillota", "Bacteroidota","Bdellovibrionota","Desulfobacterota","Nitrospirota", "Patescibacteria","Proteobacteria", "Verrucomicrobiota","Ascomycota","Basidiomycota","Glomeromycota","Mortierellomycota","Rozellomycota", "unidentified fungi"))
+
+
+soybean.module.taxa.plot <- ggplot(soybean.modules.sub, aes(y=mod.ordered))+
+  geom_bar(aes(fill = phy.sorted), stat = "count", position = "stack")+
+  facet_grid(cols = vars(kingdom), scales = "free")+
+  labs(x = "Number of ASVs/OTUs per Module", 
+       y = NULL, 
+       fill = "Phylum", tag = "B")+
+  scale_fill_manual(values = soy.mod.phy.cols)+
+  theme_minimal()+
+  theme(axis.title.x = element_text(size = 10, color = "black"), 
+      axis.text = element_text(color = "black"),
+      legend.key.size = unit(12,"pt"), 
+      legend.text = element_text(size = 9), 
+      legend.title = element_text(size = 10), panel.grid.minor = element_blank())
+soybean.module.taxa.plot
+
+soybean.module.plot+soybean.module.taxa.plot+plot_layout(guides = "collect")
+fig4 <- soybean.module.plot+soybean.module.taxa.plot+plot_layout(guides = "collect")
+```
+
+
+focus on 
+module 2 - highly correlated with soybean
+module 9 - slightly correlated with biomass and moderately negatively correlated with maize
+```{r}
+# get edges
+soybeanedgelist <- net_soybean$edgelist1
+# mod 2
+smod2 <- soybean.both.clr[, colnames(soybean.both.clr) %in% row.names(soybean.modules)[soybean.modules$soybean.modules == 2]]
+
+smod2pc <- prcomp(smod2, scale = T) # scaling doesn't really change much because its already transformed by clr.
+plot(smod2pc)
+summary(smod2pc)
+# rotation returns the loadings
+smod2.pc1 <- sort(smod2pc$rotation[,1]) 
+#subset and match
+smod2.fungi <- smod2.pc1[str_detect(names(smod2.pc1), "OTU")]
+
+guild.soybean.2<- fungi.tax.ref[fungi.tax.ref$otu_id %in% names(smod2.fungi),]
+guild.soybean.2 <- guild.soybean.2[match(names(smod2.fungi), guild.soybean.2$otu_id), ]
+
+
+mod2asso <- soybeanedgelist[soybeanedgelist$v1 %in% colnames(smod2) & soybeanedgelist$v2 %in% colnames(smod2),]
+mod2asso <- mod2asso[,1:3]
+mod2asso <- mod2asso[order(mod2asso$asso),]
+
+mod2asso$taxa1 <- all.taxa$taxa_labels[match(mod2asso$v1, row.names(all.taxa))]
+mod2asso$taxa2 <- all.taxa$taxa_labels[match(mod2asso$v2, row.names(all.taxa))]
+#write.csv(mod2asso, "soybean module 2 taxa association.csv", quote = F)
+
+# checking abundance in samples - bacteria are more abundant than fungi in soy for the co-excluding associations
+ggplot()+
+  geom_point(aes(x = soybeansamp$cond_spp, y = log(soy.qpcr.net$'RS-GCF-008905045.1-NZ-VWMY01000197.1', base = 10)))
+
+
+smod2.fungi <- data.frame(pc1=smod2.fungi, 
+                          guild.soybean.2)
+smod2.fungi$module <- 2
+
+smod2nmds <- metaMDS(smod2, distance = "euclid", k = 2)
+smod2nmds.scrs <- scores(smod2nmds, display = "sites")
+
+ggplot(smod2nmds.scrs, aes(NMDS1, NMDS2))+
+  geom_point(aes(color = soybeansamp$cond_spp), size = 2)+
+  labs(color = "Preceding\nSpecies")+
+  theme_bw()
+
+smod9 <- rownames(soybean.modules)[soybean.modules$soybean.modules==9]
+
+mod9asso <- soybeanedgelist[soybeanedgelist$v1 %in% smod9 & soybeanedgelist$v2 %in% smod9,]
+mod9asso <- mod9asso[,1:3]
+mod9asso <- mod9asso[order(mod9asso$asso),]
+
+mod9asso$taxa1 <- all.taxa$taxa_labels[match(mod9asso$v1, row.names(all.taxa))]
+mod9asso$taxa2 <- all.taxa$taxa_labels[match(mod9asso$v2, row.names(all.taxa))]
+#write.csv(mod9asso, "soybean module 9 taxa association.csv", quote = F)
+
+```
+
+# Biomass, diversity, counts plot
+```{r}
+library(patchwork)
+
+areas <- "AABB
+          CCDD
+          EEFF"
+
+
+figure1 <- bac.maize.biomass.plot+bac.maize.spad.plot+bac.maize.diversity.plot+fungi.maize.diversity.plot+CN.bac.maize+CN.maize.fungi+plot_layout(design = areas)
+figure1
+ggsave(filename = "figure1.tiff", plot = figure1, width = 7.5, height = 8)
+
+figure2 <- bac.soybean.biomass.plot+bac.soybean.spad.plot+bac.soybean.diversity.plot+fungi.soybean.diversity.plot+CN.bac.soybean+CN.soy.fungi+plot_layout(design = areas)
+figure2
+ggsave(filename = "figure2.tiff", plot = figure2, width = 7.5, height = 8)
+```
